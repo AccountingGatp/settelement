@@ -1,0 +1,121 @@
+// Run: npm test   (optional: DL_0908=/path/8_sep_download.xlsx DL_0909=/path/9_sep_download.xlsx npm test)
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { reconcile, scenarioOf } from "../lib/recon";
+import type { WOrder } from "../lib/woo";
+import type { QDoc, QItem } from "../lib/qb";
+import type { Row } from "../lib/settlement";
+import { parseSettlement } from "../lib/settlement";
+
+const items: QItem[] = [
+  { id: "1", name: "Product", sku: "P1", type: "Service", active: true },
+  { id: "2", name: "Order protection", sku: "", type: "Service", active: true },
+  { id: "3", name: "Cold packaging", sku: "", type: "Service", active: true },
+];
+const row = (order: string, amount: number, type: "sale" | "refund" = "sale"): Row => ({ order, type, amount, fileTax: 0, fileFreight: 0, txnId: "t" + order, customer: "" });
+
+/** Build a Woo order and a QBO receipt from totals. `missing` = fee lines Woo has and QBO lacks. */
+function mk(order: string, settle: number, wooTax: number, qTotal: number, qTax: number, missing: { name: string; amount: number }[] = []) {
+  const wooPre = Math.round((settle - wooTax) * 100) / 100;
+  const missSum = missing.reduce((s, m) => s + m.amount, 0);
+  const itemAmt = Math.round((wooPre - missSum) * 100) / 100;
+  const woo: WOrder = {
+    order, status: "completed", total: settle, tax: wooTax, shippingTax: 0, shipping: 0, discount: 0, refunds: [],
+    lines: [{ kind: "item", sku: "P1", name: "Product", qty: 1, amount: itemAmt, tax: 0 }, ...missing.map((m) => ({ kind: "fee" as const, sku: "", name: m.name, qty: 1, amount: m.amount, tax: 0 }))],
+  };
+  const qItem = Math.round((qTotal - qTax) * 100) / 100;
+  const q: QDoc = {
+    kind: "sale", id: "q" + order, syncToken: "0", docNumber: "Woo Order#" + order, total: qTotal, tax: qTax, inDeposit: false, customer: "", raw: {},
+    lines: [{ kind: "item", itemId: "1", name: "Product", sku: "P1", qty: 1, rate: qItem, amount: qItem, taxCode: "TAX" }],
+  };
+  return { woo, q };
+}
+
+// --- scenarios
+assert.equal(scenarioOf(11.88, 11.88), "C");
+assert.equal(scenarioOf(0, 8.62), "A");
+assert.equal(scenarioOf(5.02, 5.94), "B");
+assert.equal(scenarioOf(5, 0), "D");
+
+// matched
+{ const { woo, q } = mk("1", 200.07, 12.67, 200.07, 12.67); const v = reconcile(row("1", 200.07), woo, q, items); assert.equal(v.status, "Matched"); assert.equal(v.plan.tax, undefined); }
+
+// scenario B: QBO tax higher (order 73199 style)
+{ const { woo, q } = mk("73199", 65.01, 5.02, 65.93, 5.94); const v = reconcile(row("73199", 65.01), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.scenario, "B"); assert.equal(v.taxDiff, -0.92);
+  assert.deepEqual(v.plan.tax, { mode: "set", total: 5.02 }); assert.equal(v.plan.addLines.length, 0); }
+
+// scenario A: Woo has no tax, QBO taxed (order 73212 style)
+{ const { woo, q } = mk("73212", 160.49, 0, 163.12, 8.62, [{ name: "Order protection", amount: 5.99 }]); const v = reconcile(row("73212", 160.49), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.scenario, "A"); assert.deepEqual(v.plan.tax, { mode: "remove" });
+  assert.equal(v.plan.addLines.length, 1); assert.equal(v.plan.addLines[0].amount, 5.99); assert.equal(v.plan.addLines[0].itemId, "2"); }
+
+// missing fee only (order 73206 style)
+{ const { woo, q } = mk("73206", 172.46, 11.28, 166.47, 11.28, [{ name: "Cold packaging", amount: 5.99 }]); const v = reconcile(row("73206", 172.46), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.scenario, "C"); assert.equal(v.plan.tax, undefined); assert.equal(v.plan.addLines[0].itemName, "Cold packaging"); }
+
+// missing fee with NO matching QBO item -> review, nothing planned to write
+{ const { woo, q } = mk("73206", 172.46, 11.28, 166.47, 11.28, [{ name: "Mystery fee", amount: 5.99 }]); const v = reconcile(row("73206", 172.46), woo, q, items);
+  assert.equal(v.status, "Pending review"); assert.ok(v.blockers.some((b) => /No QuickBooks item/.test(b))); }
+
+// gap that no line explains (order 73289 style, 0.24) -> review
+{ const { woo, q } = mk("73289", 139.72, 10.05, 139.48, 10.05); const v = reconcile(row("73289", 139.72), woo, q, items);
+  assert.equal(v.status, "Pending review"); assert.ok(v.issues.some((i) => /Line|Amount/.test(i.field) && !i.auto)); }
+
+// Woo total differs from settlement -> review
+{ const { woo, q } = mk("9", 100, 5, 100, 5); woo.total = 90; const v = reconcile(row("9", 100), woo, q, items); assert.equal(v.status, "Pending review"); }
+
+// not found
+assert.equal(reconcile(row("5", 10), null, null, items).status, "Not found");
+{ const { woo } = mk("5", 10, 0, 10, 0); const v = reconcile(row("5", 10), woo, null, items); assert.equal(v.status, "Not found"); assert.match(v.blockers[0], /QuickBooks/); }
+
+// in deposit is flagged, not skipped
+{ const { woo, q } = mk("73199", 65.01, 5.02, 65.93, 5.94); q.inDeposit = true; const v = reconcile(row("73199", 65.01), woo, q, items); assert.equal(v.status, "Needs fix"); assert.ok(v.inDeposit && v.notes.includes("In deposit")); }
+
+// refund: tax-only difference (QBO total moves with its tax) -> fixable
+{
+  const woo: WOrder = { order: "70001", status: "refunded", total: 100, tax: 0, shippingTax: 0, shipping: 0, discount: 0, lines: [], refunds: [{ id: "1", total: 37.45, tax: 2.45, hasBreakdown: true }] };
+  const q: QDoc = { kind: "refund", id: "r1", syncToken: "0", docNumber: "Woo Refund#70001", total: 37.95, tax: 2.95, lines: [], inDeposit: false, customer: "", raw: {} };
+  const v = reconcile(row("70001", -37.45, "refund"), woo, q, items);
+  assert.equal(v.taxDiff, -0.5); assert.equal(v.scenario, "B"); assert.equal(v.status, "Needs fix"); assert.deepEqual(v.plan.tax, { mode: "set", total: 2.45 });
+}
+// refund 70317 as in the old sheet: totals equal but tax differs (10.22 vs 2.45). Fixing tax alone would break the total -> review
+{
+  const woo: WOrder = { order: "70317", status: "refunded", total: 100, tax: 0, shippingTax: 0, shipping: 0, discount: 0, lines: [], refunds: [{ id: "1", total: 37.45, tax: 10.22, hasBreakdown: true }] };
+  const q: QDoc = { kind: "refund", id: "r1", syncToken: "0", docNumber: "Woo Refund#70317", total: 37.45, tax: 2.45, lines: [], inDeposit: false, customer: "", raw: {} };
+  const v = reconcile(row("70317", -37.45, "refund"), woo, q, items);
+  assert.equal(v.taxDiff, 7.77); assert.equal(v.status, "Pending review");
+}
+// refund: amounts differ -> review
+{
+  const woo: WOrder = { order: "73187", status: "refunded", total: 100, tax: 0, shippingTax: 0, shipping: 0, discount: 0, lines: [], refunds: [{ id: "1", total: 68.55, tax: 5.22, hasBreakdown: true }] };
+  const q: QDoc = { kind: "refund", id: "r2", syncToken: "0", docNumber: "Woo Refund#73187", total: 62.12, tax: 6.13, lines: [], inDeposit: false, customer: "", raw: {} };
+  const v = reconcile(row("73187", -68.55, "refund"), woo, q, items);
+  assert.equal(v.status, "Pending review");
+}
+
+// --- the two real days (numbers from the old output sheets), synthesized lines
+import { SNAPSHOTS } from "../seed/snapshots";
+function csv(day: string) { return SNAPSHOTS[day].map((r) => ({ order: r.order, type: r.type, settle: r.settle, wooTax: r.wooTax, qTotal: r.qboTotal, qTax: r.qboTax })); }
+for (const [day, want] of [["0909", { sales: 49, taxDiff: 13, A: 6, B: 7, amountDiff: 20 }], ["0908", { sales: 61, taxDiff: 14, A: 5, B: 9, amountDiff: 18 }]] as const) {
+  const rows = csv(day).filter((r) => r.type === "sale");
+  let taxDiff = 0, A = 0, B = 0, amountDiff = 0;
+  for (const r of rows) {
+    const gap = Math.round((r.settle - r.qTotal - (r.wooTax - r.qTax)) * 100) / 100; // what is missing before tax
+    const { woo, q } = mk(r.order, r.settle, r.wooTax, r.qTotal, r.qTax, gap > 0.01 ? [{ name: "Cold packaging", amount: gap }] : []);
+    const v = reconcile(row(r.order, r.settle), woo, q, items);
+    if (Math.abs(v.taxDiff) > 0.01) { taxDiff++; if (v.scenario === "A") A++; if (v.scenario === "B") B++; }
+    if (Math.abs(v.totalDiff) > 0.01) amountDiff++;
+  }
+  assert.deepEqual({ sales: rows.length, taxDiff, A, B, amountDiff }, want, `day ${day}`);
+}
+console.log("logic tests passed");
+
+// --- parser on the real downloads, when their paths are given
+for (const [env, want] of [["DL_0909", { rows: 52, skipped: 15 }], ["DL_0908", { rows: 63, skipped: 17 }]] as const) {
+  const p = process.env[env];
+  if (!p) { console.log(`(skipped parser test: set ${env})`); continue; }
+  const b = fs.readFileSync(p); const s = parseSettlement(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer);
+  assert.deepEqual({ rows: s.rows.length, skipped: s.skipped.length }, want, env);
+  console.log(env, "parsed:", s.rows.length, "rows,", s.skipped.length, "skipped", s.counts);
+}
