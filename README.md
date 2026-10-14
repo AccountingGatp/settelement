@@ -15,7 +15,8 @@ re-reads each receipt to prove it now matches Woo.
 Goes to **Pending review** (never changed): a Woo total that differs from the settlement, a wrong price/quantity/discount, an extra QBO line, a missing line with no matching QBO item, any amount no line explains, an unmatched refund.
 
 ## Deploy on Vercel
-1. New Vercel project from this folder/repo. **Storage** → add **Upstash (Redis)** (sets `KV_REST_API_URL` / `KV_REST_API_TOKEN`).
+(Sharing an Upstash database with another project is fine: every key here starts with `recon:`.)
+1. New Vercel project from this folder/repo. Storage: in Supabase run `supabase.sql` once (SQL Editor), then set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` (the service_role key, server only). Or use Upstash Redis instead (`KV_REST_API_URL` / `KV_REST_API_TOKEN`).
 2. **Settings → Environment Variables** (see `.env.example`): `APP_PASSWORD`, `SESSION_SECRET`, `QB_CLIENT_ID`, `QB_CLIENT_SECRET`,
    `QB_ENVIRONMENT=sandbox`, `QB_REDIRECT_URI=https://<your-app>.vercel.app/api/qb/callback`, `WOO_URL`, `WOO_KEY`, `WOO_SECRET`.
 3. Intuit app → **Development** → Redirect URIs → add the same `QB_REDIRECT_URI`.
