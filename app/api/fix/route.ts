@@ -18,6 +18,7 @@ export const POST = handler(async (req: Request) => {
 
   await applyFix(doc, {
     tax: before.plan.tax,
+    replaceLines: before.plan.replaceLines?.map((a) => ({ itemId: a.itemId, qty: a.qty, rate: a.rate, amount: a.amount, description: a.description, discount: a.discount })),
     addLines: before.plan.addLines.map((a) => ({ itemId: a.itemId, qty: a.qty, rate: a.rate, amount: a.amount, description: a.description })),
   });
   const [woo, again, items] = await Promise.all([getOrder(row.order), reread(row.type, doc.id), listItems(true)]);

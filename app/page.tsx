@@ -5,7 +5,7 @@ type Issue = { field: string; woo: string; qbo: string; diff: number; note: stri
 type Verdict = {
   order: string; type: "sale" | "refund"; customer: string; status: "Matched" | "Needs fix" | "Pending review" | "Not found"; scenario: string;
   settle: number; wooTotal: number; wooTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
-  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; addLines: { itemName: string; amount: number }[] }; blockers: string[]; notes: string[];
+  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; addLines: { itemName: string; amount: number }[]; replaceLines?: { itemName: string; amount: number; discount?: boolean }[] }; blockers: string[]; notes: string[];
 };
 type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string };
 type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string };
@@ -238,6 +238,7 @@ function summary(v: Result) {
   const p: string[] = [];
   if (v.plan.tax) p.push(v.plan.tax.mode === "remove" ? "Remove tax" : `Set tax to ${money(v.plan.tax.total || 0)}`);
   v.plan.addLines.forEach((a) => p.push(`Add ${a.itemName} ${money(a.amount)}`));
+  if (v.plan.replaceLines) p.push(`Rebuild lines from Woo (${v.plan.replaceLines.length})`);
   if (v.status === "Pending review" || v.status === "Not found") return v.blockers[0] || v.error || "";
   return p.join("; ");
 }

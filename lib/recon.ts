@@ -10,9 +10,9 @@ const near = (a: number, b: number) => Math.abs(a - b) <= TOL + 1e-9;
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
 export type Issue = { field: string; woo: string; qbo: string; diff: number; note: string; auto: boolean };
-export type AddLine = { itemId: string; itemName: string; qty: number; rate: number; amount: number; description: string };
+export type AddLine = { itemId: string; itemName: string; qty: number; rate: number; amount: number; description: string; discount?: boolean };
 export type TaxPlan = { mode: "set"; total: number } | { mode: "remove" };
-export type Plan = { tax?: TaxPlan; addLines: AddLine[] };
+export type Plan = { tax?: TaxPlan; addLines: AddLine[]; replaceLines?: AddLine[] };
 export type Status = "Matched" | "Needs fix" | "Pending review" | "Not found";
 export type Scenario = "A" | "B" | "C" | "D" | "-";
 
@@ -73,50 +73,66 @@ export function reconcile(row: Row, woo: WOrder | null, q: QDoc | null, items: Q
 
   if (wooTotal && !near(wooTotal, settle)) v.blockers.push(`Woo total ${wooTotal.toFixed(2)} differs from the settlement amount ${settle.toFixed(2)}.`);
 
-  // --- non-tax lines (sales only; refunds are compared by total and tax)
+  // --- non-tax lines. Woo is the truth: the receipt must end up with Woo's lines and Woo's amount before tax.
   const preTaxDiff = r2((wooTotal - wooTax) - (q.total - q.tax));
-  let explained = 0;
   if (row.type === "sale") {
+    const wNet = r2(wooTotal - wooTax);
     const qlines = q.lines.filter((l) => l.kind === "item");
+    const wl = woo.lines.filter((l) => Math.abs(l.amount) > TOL || (l.kind === "item" && l.amount !== 0));
+    const hasDiscount = woo.discount > TOL || wl.some((l) => l.amount < -TOL);
+    if (hasDiscount) v.notes.push("Order has a discount: lines are compared by their total before tax.");
+    const missing: WLine[] = [], mismatch: { w: WLine; m: QLine }[] = [];
     const used = new Set<number>();
     const take = (pred: (l: QLine) => boolean) => { const i = qlines.findIndex((l, ix) => !used.has(ix) && pred(l)); if (i >= 0) used.add(i); return i >= 0 ? qlines[i] : undefined; };
-    const compareAmounts = woo.discount <= TOL;
-    if (!compareAmounts) v.notes.push("Order has a discount: line amounts are not compared.");
-    for (const w of woo.lines) {
-      if (w.amount <= TOL && w.kind !== "item") continue; // free shipping / zero fees
-      const m = (w.sku && take((l) => !!l.sku && l.sku.toLowerCase() === w.sku.toLowerCase())) || take((l) => norm(l.name) === norm(w.name)) || take((l) => near(l.amount, w.amount));
-      if (m) {
-        if (compareAmounts && !near(m.amount, w.amount)) {
-          v.issues.push({ field: `Line “${w.name}”`, woo: w.amount.toFixed(2), qbo: m.amount.toFixed(2), diff: r2(w.amount - m.amount), note: "Amount differs. Review by hand.", auto: false });
-          v.blockers.push(`Line “${w.name}” amount differs.`);
-          explained += r2(w.amount - m.amount);
-        }
-        continue;
+    if (!hasDiscount) {
+      for (const w of wl) {
+        const m = (w.sku && take((l) => !!l.sku && l.sku.toLowerCase() === w.sku.toLowerCase())) || take((l) => norm(l.name) === norm(w.name)) || take((l) => near(l.amount, w.amount));
+        if (!m) missing.push(w); else if (!near(m.amount, w.amount)) mismatch.push({ w, m });
       }
-      const item = findItem(items, w);
-      const note = item ? `Add to QuickBooks as “${item.name}”.` : "No matching QuickBooks item.";
-      v.issues.push({ field: `Missing line “${w.name}”`, woo: w.amount.toFixed(2), qbo: "-", diff: w.amount, note, auto: !!item });
-      explained += w.amount;
-      if (item) v.plan.addLines.push({ itemId: item.id, itemName: item.name, qty: w.qty, rate: r2(w.amount / (w.qty || 1)), amount: w.amount, description: w.name });
-      else v.blockers.push(`No QuickBooks item found for “${w.name}”.`);
     }
-    qlines.forEach((l, ix) => {
-      if (used.has(ix) || l.amount <= TOL) return;
-      v.issues.push({ field: `Extra line “${l.name || "line"}”`, woo: "-", qbo: l.amount.toFixed(2), diff: -l.amount, note: "In QuickBooks but not in Woo. Review by hand.", auto: false });
-      v.blockers.push(`QuickBooks has a line “${l.name || "line"}” that Woo does not.`);
-      explained -= l.amount;
-    });
-    const qDisc = q.lines.filter((l) => l.kind === "discount").reduce((s, l) => s + Math.abs(l.amount), 0);
-    if (!near(woo.discount, qDisc)) {
-      v.issues.push({ field: "Discount", woo: woo.discount.toFixed(2), qbo: qDisc.toFixed(2), diff: r2(qDisc - woo.discount), note: "Discount differs. Review by hand.", auto: false });
-      v.blockers.push("Discount differs.");
-      explained += r2(qDisc - woo.discount);
+    const extra = hasDiscount ? [] : qlines.filter((l, ix) => !used.has(ix) && l.amount > TOL);
+    const lineIssues = missing.length + mismatch.length + extra.length > 0;
+
+    if (lineIssues || !near(preTaxDiff, 0)) {
+      const missSum = r2(missing.reduce((t, w) => t + w.amount, 0));
+      const onlyMissing = !hasDiscount && missing.length > 0 && !mismatch.length && !extra.length && near(preTaxDiff, missSum);
+      const itemFor = (w: WLine, m?: QLine) => (m?.itemId ? { id: m.itemId, name: m.name } : findItem(items, w));
+      if (onlyMissing) {
+        for (const w of missing) {
+          const item = findItem(items, w);
+          v.issues.push({ field: `Missing line “${w.name}”`, woo: w.amount.toFixed(2), qbo: "-", diff: w.amount, note: item ? `Add to QuickBooks as “${item.name}”.` : "No matching QuickBooks item.", auto: !!item });
+          if (item) v.plan.addLines.push({ itemId: item.id, itemName: item.name, qty: w.qty, rate: r2(w.amount / (w.qty || 1)), amount: w.amount, description: w.name });
+          else v.blockers.push(`No QuickBooks item found for “${w.name}”.`);
+        }
+      } else {
+        for (const w of missing) v.issues.push({ field: `Missing line “${w.name}”`, woo: w.amount.toFixed(2), qbo: "-", diff: w.amount, note: "Will be added when the lines are rebuilt from Woo.", auto: true });
+        for (const x of mismatch) v.issues.push({ field: `Line “${x.w.name}”`, woo: x.w.amount.toFixed(2), qbo: x.m.amount.toFixed(2), diff: r2(x.w.amount - x.m.amount), note: "Amount differs. Will be set to Woo's.", auto: true });
+        for (const l of extra) v.issues.push({ field: `Extra line “${l.name || "line"}”`, woo: "-", qbo: l.amount.toFixed(2), diff: -l.amount, note: "In QuickBooks but not in Woo. Will be removed.", auto: true });
+        if (!lineIssues) v.issues.push({ field: "Amount before tax", woo: wNet.toFixed(2), qbo: r2(q.total - q.tax).toFixed(2), diff: preTaxDiff, note: "Lines will be rebuilt to match Woo's amount.", auto: true });
+
+        // rebuild: every Woo line, in Woo's amounts. Reuse the QuickBooks item already on the receipt when it matches.
+        const usedR = new Set<number>();
+        const takeR = (pred: (l: QLine) => boolean) => { const i = qlines.findIndex((l, ix) => !usedR.has(ix) && pred(l)); if (i >= 0) usedR.add(i); return i >= 0 ? qlines[i] : undefined; };
+        const target: AddLine[] = [];
+        let ok = true;
+        for (const w of wl) {
+          if (w.amount < -TOL) { target.push({ itemId: "", itemName: "Discount", qty: 1, rate: r2(-w.amount), amount: r2(-w.amount), description: w.name, discount: true }); continue; }
+          const m = (w.sku && takeR((l) => !!l.sku && l.sku.toLowerCase() === w.sku.toLowerCase())) || takeR((l) => norm(l.name) === norm(w.name)) || (hasDiscount ? undefined : takeR((l) => near(l.amount, w.amount)));
+          const it = itemFor(w, m);
+          if (!it) { ok = false; v.blockers.push(`No QuickBooks item found for “${w.name}”.`); continue; }
+          const qty = w.qty || 1, rate = r2(w.amount / qty);
+          const exact = Math.abs(rate * qty - w.amount) < 0.005;
+          target.push({ itemId: it.id, itemName: it.name, qty: exact ? qty : 1, rate: exact ? rate : w.amount, amount: w.amount, description: w.name });
+        }
+        const sum = r2(target.reduce((t, l) => t + (l.discount ? -l.amount : l.amount), 0));
+        if (ok && !near(sum, wNet)) { ok = false; v.blockers.push(`Woo's lines add up to ${sum.toFixed(2)} before tax, but Woo's total less tax is ${wNet.toFixed(2)}.`); }
+        if (ok) v.plan.replaceLines = target;
+      }
     }
   }
-  // anything the lines do not explain stops the automatic fix
-  if (!near(preTaxDiff, explained) && !(row.type === "refund" && !taxKnown)) {
-    v.issues.push({ field: "Amount before tax", woo: r2(wooTotal - wooTax).toFixed(2), qbo: r2(q.total - q.tax).toFixed(2), diff: r2(preTaxDiff - explained), note: "Difference that no line explains. Review by hand.", auto: false });
-    v.blockers.push(`${Math.abs(r2(preTaxDiff - explained)).toFixed(2)} of the difference is not explained by any line.`);
+  if (row.type === "refund" && !near(preTaxDiff, 0) && taxKnown) {
+    v.issues.push({ field: "Amount before tax", woo: r2(wooTotal - wooTax).toFixed(2), qbo: r2(q.total - q.tax).toFixed(2), diff: preTaxDiff, note: "Refund amounts differ. Review by hand.", auto: false });
+    v.blockers.push(`${Math.abs(preTaxDiff).toFixed(2)} of the refund difference is not explained by tax.`);
   }
 
   // --- tax

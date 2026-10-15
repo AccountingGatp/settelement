@@ -13,7 +13,7 @@ export async function POST(req: Request) {
     "Settlement amount": r.settle, "Woo total": r.wooTotal, "QBO total (before)": nf ? "" : r.qboTotal, "QBO total (after)": r.after?.qboTotal ?? "",
     "Woo tax": r.wooTax, "QBO tax (before)": nf ? "" : r.qboTax, "QBO tax (after)": r.after?.qboTax ?? "",
     "TaxDiff (before)": nf ? "" : r.taxDiff, "TaxDiff (after)": r.after ? r.after.taxDiff : "", "Tax scenario": r.scenario,
-    "Planned changes": r.final === "Skipped" ? "Skipped by the user. Nothing was changed in QuickBooks." : [r.plan.tax ? (r.plan.tax.mode === "remove" ? "Remove tax" : `Set total tax to ${r.plan.tax.total.toFixed(2)}`) : "", ...r.plan.addLines.map((a) => `Add ${a.itemName} ${a.amount.toFixed(2)}`)].filter(Boolean).join("; "),
+    "Planned changes": r.final === "Skipped" ? "Skipped by the user. Nothing was changed in QuickBooks." : [r.plan.tax ? (r.plan.tax.mode === "remove" ? "Remove tax" : `Set total tax to ${r.plan.tax.total.toFixed(2)}`) : "", ...r.plan.addLines.map((a) => `Add ${a.itemName} ${a.amount.toFixed(2)}`), ...(r.plan.replaceLines ? [`Rebuild lines from Woo: ${r.plan.replaceLines.map((a) => `${a.discount ? "-" : ""}${a.itemName} ${a.amount.toFixed(2)}`).join(", ")}`] : [])].filter(Boolean).join("; "),
     "Differences": r.issues.map((i) => `${i.field}: Woo ${i.woo}, QBO ${i.qbo}`).join("; "),
     "Needs review because": r.blockers.join("; "), "Error": r.error || "",
     };

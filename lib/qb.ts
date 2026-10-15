@@ -208,6 +208,8 @@ export type FixPlan = {
   tax?: { mode: "set"; total: number } | { mode: "remove" };
   /** lines to add (QBO item already chosen) */
   addLines?: { itemId: string; qty: number; rate: number; amount: number; description?: string }[];
+  /** replace ALL item and discount lines with these (Woo's lines); discount:true lines become discount lines */
+  replaceLines?: { itemId: string; qty: number; rate: number; amount: number; description?: string; discount?: boolean }[];
 };
 
 export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
@@ -215,13 +217,19 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
   const raw = doc.raw;
   const body: any = { Id: doc.id, SyncToken: doc.syncToken, sparse: true };
   let lines: any[] = (raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
+  // new lines are taxable when the receipt is meant to carry tax (a tax plan other than "remove", or tax already on it)
+  const newCode = plan.tax?.mode === "remove" ? "NON" : plan.tax || doc.tax > 0 ? "TAX" : "NON";
+  const itemLine = (a: { itemId: string; qty: number; rate: number; amount: number; description?: string }) => ({
+    DetailType: "SalesItemLineDetail", Amount: a.amount, Description: a.description,
+    SalesItemLineDetail: { ItemRef: { value: a.itemId }, Qty: a.qty, UnitPrice: a.rate, TaxCodeRef: { value: newCode } },
+  });
 
-  for (const a of plan.addLines || []) {
-    lines.push({
-      DetailType: "SalesItemLineDetail", Amount: a.amount, Description: a.description,
-      SalesItemLineDetail: { ItemRef: { value: a.itemId }, Qty: a.qty, UnitPrice: a.rate, TaxCodeRef: { value: "NON" } },
-    });
+  if (plan.replaceLines) {
+    lines = lines.filter((l: any) => l.DetailType !== "SalesItemLineDetail" && l.DetailType !== "DiscountLineDetail");
+    for (const a of plan.replaceLines)
+      lines.push(a.discount ? { DetailType: "DiscountLineDetail", Amount: a.amount, Description: a.description, DiscountLineDetail: { PercentBased: false } } : itemLine(a));
   }
+  for (const a of plan.addLines || []) lines.push(itemLine(a));
   if (plan.tax?.mode === "remove") {
     lines = lines.map((l) => (l.DetailType === "SalesItemLineDetail" ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: "NON" } } } : l));
     body.TxnTaxDetail = { TotalTax: 0 };

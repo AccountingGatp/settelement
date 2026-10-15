@@ -58,9 +58,31 @@ assert.equal(scenarioOf(5, 0), "D");
 { const { woo, q } = mk("73206", 172.46, 11.28, 166.47, 11.28, [{ name: "Mystery fee", amount: 5.99 }]); const v = reconcile(row("73206", 172.46), woo, q, items);
   assert.equal(v.status, "Pending review"); assert.ok(v.blockers.some((b) => /No QuickBooks item/.test(b))); }
 
-// gap that no line explains (order 73289 style, 0.24) -> review
+// gap that no single line explains (order 73289 style, 0.24): Woo is the truth, so the lines are rebuilt from Woo
 { const { woo, q } = mk("73289", 139.72, 10.05, 139.48, 10.05); const v = reconcile(row("73289", 139.72), woo, q, items);
-  assert.equal(v.status, "Pending review"); assert.ok(v.issues.some((i) => /Line|Amount/.test(i.field) && !i.auto)); }
+  assert.equal(v.status, "Needs fix"); assert.ok(v.plan.replaceLines && v.plan.replaceLines.length === 1); assert.equal(v.plan.replaceLines![0].amount, 129.67); assert.equal(v.plan.replaceLines![0].itemId, "1"); }
+
+// price differs on a matched line -> rebuilt, and tax is set too
+{ const { woo, q } = mk("20", 110, 10, 120, 8); const v = reconcile(row("20", 110), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.ok(v.plan.replaceLines); assert.deepEqual(v.plan.tax, { mode: "set", total: 10 }); assert.ok(v.issues.some((i) => /Line/.test(i.field) && i.auto)); }
+
+// extra line in QBO that Woo does not have -> removed by the rebuild
+{ const { woo, q } = mk("21", 100, 0, 106, 0); q.lines.push({ kind: "item", itemId: "2", name: "Order protection", sku: "", qty: 1, rate: 6, amount: 6, taxCode: "NON" }); q.lines[0].amount = 100; q.lines[0].rate = 100;
+  const v = reconcile(row("21", 100), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.plan.replaceLines?.length, 1); assert.ok(v.issues.some((i) => /Extra line/.test(i.field))); }
+
+// Woo discount as a negative fee that QBO never had: rebuilt with a discount line, total ends at Woo's
+{ const { woo, q } = mk("22", 90, 0, 100, 0); woo.lines = [{ kind: "item", sku: "P1", name: "Product", qty: 1, amount: 100, tax: 0 }, { kind: "fee", sku: "", name: "10% off", qty: 1, amount: -10, tax: 0 }]; woo.discount = 0;
+  const v = reconcile(row("22", 90), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.plan.replaceLines?.length, 2); assert.equal(v.plan.replaceLines![1].discount, true); assert.equal(v.plan.replaceLines![1].amount, 10); }
+
+// Woo coupon discount, QBO lines already at the discounted amount: nothing to rebuild, only the tax is set (order 73286 style)
+{ const { woo, q } = mk("73286", 39.18, 1.6, 37.58, 0); woo.discount = 5; q.lines[0].taxCode = "NON"; const v = reconcile(row("73286", 39.18), woo, q, items);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.plan.replaceLines, undefined); assert.deepEqual(v.plan.tax, { mode: "set", total: 1.6 }); assert.equal(v.scenario, "D"); }
+
+// rebuild needs an item for every Woo line; none for a new line -> review
+{ const { woo, q } = mk("23", 100, 0, 90, 0, [{ name: "Mystery fee", amount: 10 }]); woo.lines[0].amount = 95; woo.lines[1].amount = 5; const v = reconcile(row("23", 100), woo, q, items);
+  assert.equal(v.status, "Pending review"); assert.ok(v.blockers.some((b) => /No QuickBooks item/.test(b))); }
 
 // Woo total differs from settlement -> review
 { const { woo, q } = mk("9", 100, 5, 100, 5); woo.total = 90; const v = reconcile(row("9", 100), woo, q, items); assert.equal(v.status, "Pending review"); }
