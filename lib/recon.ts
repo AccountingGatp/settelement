@@ -17,14 +17,14 @@ export type Status = "Matched" | "Needs fix" | "Pending review" | "Not found";
 export type Scenario = "A" | "B" | "C" | "D" | "-";
 
 export type Verdict = {
-  order: string; type: "sale" | "refund"; customer: string; status: Status; scenario: Scenario;
+  order: string; type: "sale" | "refund"; customer: string; date?: string; depositNo?: string; receivedFrom?: string; qboCustomer?: string; status: Status; scenario: Scenario;
   settle: number; wooTotal: number; wooTax: number; qboTotal: number; qboTax: number;
   taxDiff: number; totalDiff: number; inDeposit: boolean;
   issues: Issue[]; plan: Plan; blockers: string[]; notes: string[];
 };
 
 const blank = (row: Row): Verdict => ({
-  order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-",
+  order: row.order, type: row.type, customer: row.customer, date: row.date, depositNo: row.depositNo, receivedFrom: row.receivedFrom, status: "Pending review", scenario: "-",
   settle: row.amount, wooTotal: 0, wooTax: 0, qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false,
   issues: [], plan: { addLines: [] }, blockers: [], notes: [],
 });
@@ -66,6 +66,7 @@ export function reconcile(row: Row, woo: WOrder | null, q: QDoc | null, items: Q
     if (!pick) { v.blockers.push(exact.length > 1 ? "More than one Woo refund has this amount." : "Could not match a Woo refund to this credit."); wooTotal = 0; wooTax = 0; taxKnown = false; }
     else { wooTotal = pick.total; wooTax = pick.tax; taxKnown = pick.hasBreakdown; if (!taxKnown) v.notes.push("The Woo refund has no line breakdown, so its tax is unknown."); }
   }
+  v.qboCustomer = q.customer; // the customer name QuickBooks holds; the output file's "Received From" uses it
   v.settle = settle; v.wooTotal = wooTotal; v.wooTax = wooTax; v.qboTotal = q.total; v.qboTax = q.tax; v.inDeposit = q.inDeposit;
   v.totalDiff = r2(wooTotal - q.total);
   if (taxKnown) { v.taxDiff = r2(wooTax - q.tax); v.scenario = scenarioOf(wooTax, q.tax); }

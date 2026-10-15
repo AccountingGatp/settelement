@@ -13,7 +13,7 @@ export const POST = handler(async (req: Request) => {
     if (!b || !Array.isArray(b.rows)) throw new Error("No file was received. Please choose the file again.");
     const rows = b.rows.map((r: any) => {
       if (!/^\d+$/.test(String(r.order)) || (r.type !== "sale" && r.type !== "refund") || !Number.isFinite(Number(r.amount))) throw new Error("The file has a row that could not be read.");
-      return { order: String(r.order), type: r.type, amount: Number(r.amount), fileTax: Number(r.fileTax || 0), fileFreight: Number(r.fileFreight || 0), txnId: String(r.txnId || ""), customer: String(r.customer || "") };
+      return { order: String(r.order), type: r.type, amount: Number(r.amount), fileTax: Number(r.fileTax || 0), fileFreight: Number(r.fileFreight || 0), txnId: String(r.txnId || ""), customer: String(r.customer || ""), date: String(r.date || ""), depositNo: String(r.depositNo || ""), receivedFrom: String(r.receivedFrom || "") };
     });
     s = { rows, skipped: Array.isArray(b.skipped) ? b.skipped : [], problems: Array.isArray(b.problems) ? b.problems.map(String) : [], counts: b.counts && typeof b.counts === "object" ? b.counts : {} };
   } else {

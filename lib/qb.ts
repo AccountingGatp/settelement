@@ -314,6 +314,8 @@ export async function probeTax(order: string, target: number): Promise<string[]>
     { name: "1. TotalTax only", detail: () => ({ TotalTax: target }) },
     { name: "2. TotalTax + tax code + tax line", detail: (net) => code && ({ TxnTaxCodeRef: { value: code.Id }, TotalTax: target, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
     { name: "3. Tax code + tax line, no TotalTax", detail: (net) => code && ({ TxnTaxCodeRef: { value: code.Id }, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
+    { name: "4. TotalTax + UseAutomatedSalesTax=false", detail: () => ({ TotalTax: target, UseAutomatedSalesTax: false }) },
+    { name: "5. Tax code + tax line + UseAutomatedSalesTax=false", detail: (net) => code && ({ UseAutomatedSalesTax: false, TxnTaxCodeRef: { value: code.Id }, TotalTax: target, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
   ];
   for (const v of variants) {
     try {
@@ -330,4 +332,33 @@ export async function probeTax(order: string, target: number): Promise<string[]>
     } catch (e) { out.push(`${v.name}: refused. ${e instanceof Error ? e.message : e}`); }
   }
   return out;
+}
+
+
+// ---------------------------------------------------------------- rollback and failure reasons
+/** Put a receipt back to what it was before a fix: its original lines and tax detail. Returns the receipt as re-read. */
+export async function restore(kind: Kind, id: string, original: any): Promise<QDoc> {
+  assertWritable();
+  const cur = await reread(kind, id);
+  // lines go back without their old ids (the fix may have deleted those lines), so QuickBooks creates them again
+  const lines = (original.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail").map((l: any) => { const { Id, LineNum, ...rest } = l; return rest; });
+  const body: any = { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines };
+  if (original.TxnTaxDetail) body.TxnTaxDetail = original.TxnTaxDetail;
+  await api(PATH[kind], body);
+  return reread(kind, id);
+}
+
+/** A short, plain reason for a failed fix, from QuickBooks's message or from what the re-read showed. */
+export function explainFailure(err: unknown, ctx?: { taxStillWrong?: boolean; totalStillWrong?: boolean; linesStillWrong?: boolean }): string {
+  const m = err instanceof Error ? err.message : String(err ?? "");
+  if (/activate this item|inactive/i.test(m)) return "A QuickBooks item on the receipt is inactive.";
+  if (/stale|syncToken/i.test(m)) return "Someone changed the receipt while the fix was running. Run the check again.";
+  if (/period|closing date|closed/i.test(m)) return "The accounting period is closed for this date.";
+  if (/amount is not equal to unitprice/i.test(m)) return "A line's amount does not equal price times quantity.";
+  if (/not connected|connect/i.test(m)) return "QuickBooks is not connected.";
+  if (/writes|ALLOW_PRODUCTION/i.test(m)) return "Saving to the real company is switched off.";
+  if (m) return m.length > 160 ? m.slice(0, 160) + "…" : m;
+  if (ctx?.taxStillWrong) return "QuickBooks did not take the new tax amount.";
+  if (ctx?.totalStillWrong || ctx?.linesStillWrong) return "The receipt still differs from Woo after saving.";
+  return "Unknown.";
 }

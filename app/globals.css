@@ -116,3 +116,8 @@ main.wide { max-width: 1100px; }
 
 .chip.Skipped{background:#eceff1;color:#455a64}
 .nowrap{white-space:nowrap}
+
+.sect{margin-top:22px}
+.sect h3{margin:0 0 2px}
+
+.chip.Failed{background:#fdecea;color:#b71c1c}

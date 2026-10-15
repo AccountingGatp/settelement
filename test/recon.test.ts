@@ -131,6 +131,35 @@ for (const [day, want] of [["0909", { sales: 49, taxDiff: 13, A: 6, B: 7, amount
   }
   assert.deepEqual({ sales: rows.length, taxDiff, A, B, amountDiff }, want, `day ${day}`);
 }
+import { explainFailure } from "../lib/qb";
+assert.match(explainFailure(new Error("You need to activate this item before updating the quantity.")), /inactive/);
+assert.match(explainFailure(new Error("Stale Object Error: SyncToken")), /changed the receipt/);
+assert.equal(explainFailure(null, { taxStillWrong: true }), "QuickBooks did not take the new tax amount.");
+// --- output workbook layout (same columns and sign rules as the team's file)
+import { buildOutput, type OutRow } from "../lib/outputSheet";
+import ExcelJS from "exceljs";
+(async () => {
+  const base = (o: Partial<OutRow>): OutRow => ({ order: "1", type: "sale", customer: "", date: "09/09/2026", depositNo: "AN0909", receivedFrom: "A B (a@b.com)", status: "Matched", scenario: "C", settle: 0, wooTotal: 0, wooTax: 0, qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false, issues: [], plan: { addLines: [] }, blockers: [], notes: [], ...o });
+  const fixedAfter = base({ order: "73199", settle: 65.01, wooTotal: 65.01, wooTax: 5.02, qboTotal: 65.93, qboTax: 5.94, status: "Needs fix", final: "Corrected, verified", plan: { addLines: [], tax: { mode: "set", total: 5.02 } }, issues: [{ field: "Tax", woo: "5.02", qbo: "5.94", diff: -0.92, note: "", auto: true }], after: base({ order: "73199", wooTax: 5.02, qboTotal: 65.01, qboTax: 5.02 }) });
+  const refund = base({ order: "73187", type: "refund", settle: 68.55, wooTotal: 68.55, wooTax: 5.22, qboTotal: 62.12, qboTax: 6.13, status: "Pending review", blockers: ["refund differs"] });
+  const nf = base({ order: "999", settle: 10, wooTax: 1, status: "Not found", blockers: ["not found"] });
+  const rolled = base({ order: "5", settle: 100, wooTotal: 100, wooTax: 8, qboTotal: 100, qboTax: 0, status: "Needs fix", final: "Failed, rolled back", rolledBack: true, after: base({ qboTotal: 100, qboTax: 0, wooTax: 8 }) });
+  const { buffer, filename } = await buildOutput([fixedAfter, refund, nf, rolled], "Test Account");
+  assert.equal(filename, "AuthorizeNet_09_Sep_output.xlsx");
+  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(buffer as any);
+  assert.deepEqual(wb.worksheets.map((w) => w.name), ["main", "Sales_Authnet", "Changes"]);
+  const val = (c: ExcelJS.CellValue) => (c && typeof c === "object" && "formula" in c ? ((c as any).result ?? 0) : c); // a cached result of 0 is not stored; Excel recalculates on open
+  const m = wb.getWorksheet("main")!, b = wb.getWorksheet("Sales_Authnet")!;
+  assert.deepEqual((m.getRow(1).values as any[]).slice(1), ["Deposit No", "Deposit To Account", "Date", "Received From", "Linked Transaction Type", "Line Amount", "Currency Code", "Linked Transaction Number", "dattt", "File Amount", "Discount", "Order Total Tax Amount", "QBSalesTax", "TaxDiff"]);
+  const r = (ws: ExcelJS.Worksheet, n: number) => (ws.getRow(n).values as any[]).slice(1).map(val);
+  assert.deepEqual(r(m, 2), ["AN0909", "Test Account", "09/09/2026", "A B (a@b.com)", "SalesReceipt", 65.01, "USD", "Woo Order#73199", "09/09/2026", 65.01, 0, 5.02, 5.02, 0]);   // fixed: after
+  assert.deepEqual(r(b, 2), ["AN0909", "Test Account", "09/09/2026", "A B (a@b.com)", "SalesReceipt", 65.93, "USD", "Woo Order#73199", "09/09/2026", 65.01, 0.92, 5.02, 5.94, -0.92]); // before
+  assert.deepEqual(r(m, 3).slice(4, 14), ["RefundReceipt", -62.12, "USD", "Woo Refund#73187", "09/09/2026", -68.55, 6.43, -5.22, -6.13, 0.91]);       // refund signs
+  assert.deepEqual(r(m, 4).slice(5, 14), ["", "USD", "Woo Order#999", "09/09/2026", 10, "", 1, "", ""]);                                              // not found: QBO blank
+  assert.deepEqual(r(m, 5).slice(5, 14), [100, "USD", "Woo Order#5", "09/09/2026", 100, 0, 8, 0, 8]);                                                // rolled back: still the old values
+  assert.equal(((m.getCell("K2").value as any).formula), "F2-J2"); assert.equal(((m.getCell("N2").value as any).formula), "L2-M2");
+  console.log("output workbook tests passed");
+})();
 console.log("logic tests passed");
 
 // --- parser on the real downloads, when their paths are given

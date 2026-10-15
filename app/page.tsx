@@ -8,8 +8,8 @@ type Verdict = {
   settle: number; wooTotal: number; wooTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
   issues: Issue[]; plan: { tax?: { mode: string; total?: number }; addLines: { itemName: string; amount: number }[]; replaceLines?: { itemName: string; amount: number; discount?: boolean }[] }; blockers: string[]; notes: string[];
 };
-type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string };
-type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string };
+type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
+type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean };
 type ReadOut = {
   rows: Row[]; skipped: { txnId: string; order: string; status: string; amount: number; reason: string }[]; problems: string[];
   counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[];
@@ -84,13 +84,16 @@ export default function Home() {
     return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", settle: row.amount, wooTotal: 0, wooTax: 0, qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false, issues: [], plan: { addLines: [] }, blockers: [], notes: [] };
   }
 
-  async function fixOne(row: Row) {
+  async function fixOne(row: Row): Promise<string> {
     const k = key(row);
     try {
       const j = await post("/api/fix", { row });
-      setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: j.applied ? (j.verified ? "Corrected, verified" : "Failed") : undefined, after: j.applied ? j.after : undefined, message: j.message, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
+      const fin = j.verified ? "Corrected, verified" : j.refused ? "Failed" : j.applied ? (j.rolledBack ? "Failed, rolled back" : "Failed, check by hand") : "";
+      setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: fin || undefined, after: j.applied ? j.after : undefined, message: j.message, reason: j.reason, rolledBack: j.rolledBack, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
+      return fin;
     } catch (e) {
       setRes((p) => ({ ...p, [k]: { ...p[k], final: "Failed", error: e instanceof Error ? e.message : String(e) } }));
+      return "Failed";
     }
   }
 
@@ -106,14 +109,30 @@ export default function Home() {
     if (!confirm(`Apply the planned fix to ${todo.length} receipt(s) in QuickBooks?\n\nEach one is re-checked, saved and verified.`)) return;
     cancel.current = false; let done = 0;
     setProgress({ done, total: todo.length, label: "Fixing" });
-    await pool(todo, 1, async (row) => { await fixOne(row); setProgress({ done: ++done, total: todo.length, label: "Fixing" }); }, () => cancel.current);
+    let failsInARow = 0;
+    await pool(todo, 1, async (row) => {
+      const f = await fixOne(row);
+      setProgress({ done: ++done, total: todo.length, label: "Fixing" });
+      failsInARow = f.startsWith("Failed") ? failsInARow + 1 : 0;
+      if (failsInARow >= 3) { cancel.current = true; setErr("Stopped: 3 fixes in a row failed. Look at the failed rows before going on."); }
+    }, () => cancel.current);
     setProgress(null);
   }
 
+  /** Every row that is not matched or fixed, with the reason and the exact change it needs, so nothing is lost. */
+  function needsPerson() {
+    const q = (x: string) => `"${String(x ?? "").replace(/"/g, '""')}"`;
+    const rows = Object.values(res).filter((v) => v.final !== "Corrected, verified" && v.status !== "Matched");
+    const head = ["Order", "Type", "Status", "Settlement", "Woo total", "Woo tax", "QBO total", "QBO tax", "TaxDiff", "Change needed", "Reason"];
+    const lines = rows.map((v) => [v.order, v.type, v.final || v.status, money(v.settle), money(v.wooTotal), money(v.wooTax), v.status === "Not found" ? "" : money(v.qboTotal), v.status === "Not found" ? "" : money(v.qboTax), v.status === "Not found" ? "" : money(v.taxDiff),
+      v.final === "Skipped" ? "Skipped: " + summary({ ...v, final: undefined }) : summary(v), [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | ")].map(q).join(","));
+    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([[head.map(q).join(","), ...lines].join("\n")], { type: "text/csv" })); a.download = "needs-a-person.csv"; a.click();
+  }
+
   async function report() {
-    const r = await fetch("/api/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ results: Object.values(res) }) });
+    const r = await fetch("/api/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ results: (read ? read.rows : []).map((r) => res[key(r)]).filter(Boolean) }) });
     if (!r.ok) return setErr("Could not build the report.");
-    const a = document.createElement("a"); a.href = URL.createObjectURL(await r.blob()); a.download = "reconciliation-report.xlsx"; a.click();
+    const a = document.createElement("a"); a.href = URL.createObjectURL(await r.blob()); const cd = r.headers.get("Content-Disposition") || ""; a.download = (cd.match(/filename="([^"]+)"/) || [])[1] || "output.xlsx"; a.click();
   }
 
   const list = useMemo(() => (read ? read.rows.map((r) => ({ row: r, v: res[key(r)] })) : []), [read, res]);
@@ -148,6 +167,7 @@ export default function Home() {
                       detail={<div>
                         {v.error && <div className="alert">{v.error}</div>}
                         {v.message && <p className="small">{v.message}</p>}
+                        {v.reason && <p className="small"><b>Reason:</b> {v.reason}</p>}
                         {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
                         {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: Woo {i.woo}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
                         {v.after && <p className="small">After saving: QuickBooks total {money(v.after.qboTotal)}, tax {money(v.after.qboTax)}, TaxDiff {money(v.after.taxDiff)}.</p>}
@@ -202,7 +222,8 @@ export default function Home() {
           <div className="row-actions">
             <button className="btn small" disabled={!!progress} onClick={runChecks}>{Object.keys(res).length ? "Run the check again" : "Run the check"}</button>
             {progress && <button className="btn small ghost" onClick={() => (cancel.current = true)}>Stop</button>}
-            <button className="btn small ghost" disabled={!Object.keys(res).length} onClick={report}>Download report (Excel)</button>
+            <button className="btn small ghost" disabled={!Object.keys(res).length} onClick={report}>Download output file (Excel)</button>
+            <button className="btn small ghost" disabled={!Object.keys(res).length} onClick={needsPerson}>Download list for a person (CSV)</button>
           </div>
           {progress && <><div className="bar"><i style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div><p className="small muted">{progress.label}: {progress.done} of {progress.total}</p></>}
           {Object.keys(res).length > 0 && (

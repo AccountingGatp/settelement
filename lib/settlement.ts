@@ -1,9 +1,16 @@
 // Reads the Authorize.net settlement download (xlsx/csv) and keeps only settled sales and credited refunds.
 import * as XLSX from "xlsx";
 
-export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string };
+export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
 export type Skipped = { txnId: string; order: string; status: string; amount: number; reason: string };
 export type Settlement = { rows: Row[]; skipped: Skipped[]; problems: string[]; counts: Record<string, number> };
+
+const MON: Record<string, string> = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
+/** "09-Sep-2026 06:23:52 PM PDT" -> "09/09/2026" */
+function settleDate(v: unknown): string {
+  const m = String(v || "").match(/(\d{1,2})-([A-Za-z]{3})[a-z]*-(\d{4})/);
+  return m ? `${MON[m[2].toLowerCase()] || "01"}/${m[1].padStart(2, "0")}/${m[3]}` : "";
+}
 
 const num = (v: unknown) => {
   const x = Number(String(v ?? "").replace(/[^0-9.\-]/g, ""));
@@ -24,7 +31,8 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
     const k = `${type}:${order}:${amount}`;
     if (seen.has(k)) { problems.push(`Order ${order} appears more than once with the same ${type} amount (${amount.toFixed(2)}). Check the file.`); continue; }
     seen.add(k);
-    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: num(d["Order Total Tax Amount"]), fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, "") });
+    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: num(d["Order Total Tax Amount"]), fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
+      date: String(d["Date"] || ""), depositNo: String(d["Deposit No"] || ""), receivedFrom: String(d["Received From"] || "") });
   }
   return { rows, skipped: [], problems, counts: { "Rows in the output workbook": rows.length } };
 }
@@ -65,6 +73,12 @@ export function parseSettlement(buf: ArrayBuffer): Settlement {
     rows.push({
       order, type, amount, txnId, fileTax: num(d["L2 - Tax"]), fileFreight: num(d["L2 - Freight"]),
       customer: [d["Customer First Name"], d["Customer Last Name"]].filter(Boolean).join(" "),
+      ...(() => {
+        const date = settleDate(d["Settlement Date/Time"]);
+        const name = [d["Customer First Name"], d["Customer Last Name"]].filter(Boolean).join(" ");
+        const email = String(d["Email"] || "").trim();
+        return { date, depositNo: date ? "AN" + date.slice(0, 2) + date.slice(3, 5) : "", receivedFrom: name + (email ? ` (${email})` : "") };
+      })(),
     });
   }
   return { rows, skipped, problems, counts };
