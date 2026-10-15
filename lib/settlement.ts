@@ -10,15 +10,40 @@ const num = (v: unknown) => {
   return Number.isFinite(x) ? Math.round(x * 100) / 100 : 0;
 };
 
+/** The team's output workbook ("main" sheet: Linked Transaction Number, File Amount ...). Only the order numbers, type and
+ *  settlement amount are used from it; every other figure is read fresh from Woo and QuickBooks. */
+function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
+  const rows: Row[] = [], problems: string[] = [], seen = new Set<string>();
+  for (const d of data) {
+    const link = String(d["Linked Transaction Number"] || "").trim();
+    const order = (link.match(/(\d+)\s*$/) || [])[1];
+    if (!order) continue;
+    const t = String(d["Linked Transaction Type"] || "").toLowerCase();
+    const type: "sale" | "refund" = /refund|credit/.test(t) || /refund/i.test(link) ? "refund" : "sale";
+    const amount = num(d["File Amount"] !== "" && d["File Amount"] != null ? d["File Amount"] : d["Line Amount"]);
+    const k = `${type}:${order}:${amount}`;
+    if (seen.has(k)) { problems.push(`Order ${order} appears more than once with the same ${type} amount (${amount.toFixed(2)}). Check the file.`); continue; }
+    seen.add(k);
+    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: num(d["Order Total Tax Amount"]), fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, "") });
+  }
+  return { rows, skipped: [], problems, counts: { "Rows in the output workbook": rows.length } };
+}
+
 export function parseSettlement(buf: ArrayBuffer): Settlement {
   const wb = XLSX.read(buf, { type: "array" });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const data = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: "", raw: false });
+  const sheetRows = (name: string) => XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[name], { defval: "", raw: false });
+  // output workbook: use its "main" sheet (or the first sheet that has the columns)
+  for (const name of ["main", ...wb.SheetNames]) {
+    if (!wb.Sheets[name]) continue;
+    const r = sheetRows(name);
+    if (r.length && "Linked Transaction Number" in r[0] && ("File Amount" in r[0] || "Line Amount" in r[0])) return parseOutputSheet(r);
+  }
+  const data = sheetRows(wb.SheetNames[0]);
   const problems: string[] = [];
   if (!data.length) return { rows: [], skipped: [], problems: ["The file has no rows."], counts: {} };
   const need = ["Transaction ID", "Transaction Status", "Transaction Type", "Settlement Amount", "Invoice Number"];
   const missing = need.filter((h) => !(h in data[0]));
-  if (missing.length) return { rows: [], skipped: [], problems: [`This does not look like an Authorize.net settlement download. Missing columns: ${missing.join(", ")}.`], counts: {} };
+  if (missing.length) return { rows: [], skipped: [], problems: [`This does not look like an Authorize.net settlement download or the output workbook. Missing columns: ${missing.join(", ")}.`], counts: {} };
 
   const rows: Row[] = [], skipped: Skipped[] = [], counts: Record<string, number> = {};
   const seen = new Map<string, number>();
