@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { parseSettlement } from "@/lib/settlement";
 
 type Issue = { field: string; woo: string; qbo: string; diff: number; note: string; auto: boolean };
 type Verdict = {
@@ -50,9 +51,12 @@ export default function Home() {
   async function upload(f: File) {
     setErr(""); setRead(null); setRes({}); setBusy("Reading the file and looking up QuickBooks…");
     try {
-      const fd = new FormData(); fd.append("file", f);
-      const r = await fetch("/api/read", { method: "POST", body: fd });
-      const j = await r.json();
+      // The file is read here in the browser (the output workbooks are over 5 MB, more than the server accepts);
+      // only the small list of rows goes to the server.
+      if (!/\.(xlsx|xls|csv)$/i.test(f.name)) throw new Error("Please choose an .xlsx or .csv file.");
+      const settlement = parseSettlement(await f.arrayBuffer());
+      const r = await fetch("/api/read", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settlement }) });
+      const j = await r.json().catch(() => ({ error: `Server error ${r.status}` }));
       if (!r.ok || j.error) throw new Error(j.error || "Could not read the file.");
       setRead(j); if (j.missingInQbo?.length) setPopup(true);
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
