@@ -90,6 +90,11 @@ export default function Home() {
     }
   }
 
+  function skipOne(row: Row, on: boolean) {
+    const k = key(row);
+    setRes((p) => ({ ...p, [k]: { ...p[k], final: on ? "Skipped" : undefined } }));
+  }
+
   async function fixAll() {
     if (!read) return;
     const todo = read.rows.filter((r) => res[key(r)]?.status === "Needs fix" && !res[key(r)]?.final);
@@ -183,7 +188,10 @@ export default function Home() {
                         <td className="num">{money(v.wooTax)}</td><td className="num">{money(v.qboTax)}</td>
                         <td className="num">{v.status === "Not found" ? "–" : v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
                         <td className="small">{summary(v)}</td>
-                        <td>{v.status === "Needs fix" && !v.final && <button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button>}</td>
+                        <td className="nowrap">
+                          {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button> <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
+                          {v.final === "Skipped" && <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
+                        </td>
                       </>}
                       detail={<div>
                         {v.error && <div className="alert">{v.error}</div>}
