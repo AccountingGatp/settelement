@@ -226,6 +226,9 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
     lines = lines.map((l) => (l.DetailType === "SalesItemLineDetail" ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: "NON" } } } : l));
     body.TxnTaxDetail = { TotalTax: 0 };
   } else if (plan.tax?.mode === "set") {
+    // a manual tax amount is only considered when at least one line is taxable
+    const anyTaxable = lines.some((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.TaxCodeRef?.value && l.SalesItemLineDetail.TaxCodeRef.value !== "NON");
+    if (!anyTaxable) lines = lines.map((l) => (l.DetailType === "SalesItemLineDetail" ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: "TAX" } } } : l));
     body.TxnTaxDetail = { ...(raw.TxnTaxDetail || {}), TotalTax: plan.tax.total };
   }
   body.Line = lines;
@@ -247,7 +250,14 @@ export async function incomeAccountId(): Promise<string> {
 export async function ensureItem(name: string, sku: string): Promise<QItem> {
   const items = await listItems();
   const hit = (sku && items.find((i) => i.sku && i.sku.toLowerCase() === sku.toLowerCase())) || items.find((i) => i.name.toLowerCase() === name.toLowerCase());
-  if (hit) return hit;
+  if (hit) {
+    if (hit.active) return hit;
+    assertWritable(); // sandbox seeding only: switch an inactive item back on so it can be used
+    const cur = (await api(`item/${hit.id}`)).Item;
+    await api("item", { Id: cur.Id, SyncToken: cur.SyncToken, Active: true, sparse: true });
+    itemCache = null;
+    return { ...hit, active: true };
+  }
   assertWritable();
   const j = await api("item", { Name: name.slice(0, 100), Sku: sku || undefined, Type: "Service", IncomeAccountRef: { value: await incomeAccountId() }, Taxable: false });
   const it: QItem = { id: j.Item.Id, name: j.Item.Name, sku: j.Item.Sku || "", type: j.Item.Type, active: true };
@@ -268,7 +278,7 @@ export async function createReceipt(kind: Kind, p: { docNumber: string; customer
     DocNumber: p.docNumber, TxnDate: p.date, CustomerRef: { value: p.customerId },
     Line: p.lines.map((l) => ({
       DetailType: "SalesItemLineDetail", Amount: l.amount,
-      SalesItemLineDetail: { ItemRef: { value: l.itemId }, Qty: l.qty, UnitPrice: l.rate, TaxCodeRef: { value: "NON" } },
+      SalesItemLineDetail: { ItemRef: { value: l.itemId }, Qty: l.qty, UnitPrice: l.rate, TaxCodeRef: { value: p.totalTax > 0 ? "TAX" : "NON" } },
     })),
     TxnTaxDetail: { TotalTax: p.totalTax },
   });
