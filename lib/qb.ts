@@ -292,3 +292,42 @@ export async function createReceipt(kind: Kind, p: { docNumber: string; customer
   });
   return view(kind, j[ENTITY[kind]], await listItems());
 }
+
+// ---------------------------------------------------------------- tax probe (SANDBOX ONLY)
+/** Tries several ways of sending a manual tax amount to one sandbox receipt and reports what QuickBooks did with each. */
+export async function probeTax(order: string, target: number): Promise<string[]> {
+  if (ENV !== "sandbox") throw new Error("The tax test only runs on the sandbox company.");
+  assertWritable();
+  const out: string[] = [];
+  const first = await findDoc("sale", order);
+  if (!first) throw new Error(`Receipt for order ${order} was not found in the sandbox.`);
+  try {
+    const p = (await api("preferences")).Preferences?.TaxPrefs || {};
+    out.push(`Company tax settings: UsingSalesTax=${p.UsingSalesTax}, PartnerTaxEnabled=${p.PartnerTaxEnabled} (true means QuickBooks calculates tax itself)`);
+  } catch (e) { out.push(`Could not read tax settings: ${e instanceof Error ? e.message : e}`); }
+  const codes = (await queryAll("TaxCode", "")).filter((c: any) => !["TAX", "NON"].includes(c.Name) && c.SalesTaxRateList?.TaxRateDetail?.[0]);
+  const code = codes[0];
+  out.push(code ? `Tax code used for the variants: ${code.Name} (id ${code.Id}), rate id ${code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value}` : "No named tax code with a rate exists in this company; variants 2 and 3 are skipped.");
+  out.push(`Before: total ${first.total}, tax ${first.tax}. Target tax: ${target}`);
+
+  const variants: { name: string; detail: (net: number) => any | null }[] = [
+    { name: "1. TotalTax only", detail: () => ({ TotalTax: target }) },
+    { name: "2. TotalTax + tax code + tax line", detail: (net) => code && ({ TxnTaxCodeRef: { value: code.Id }, TotalTax: target, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
+    { name: "3. Tax code + tax line, no TotalTax", detail: (net) => code && ({ TxnTaxCodeRef: { value: code.Id }, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
+  ];
+  for (const v of variants) {
+    try {
+      const doc = await reread("sale", first.id);
+      const lines = (doc.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail").map((l: any) =>
+        l.DetailType === "SalesItemLineDetail" ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: "TAX" } } } : l);
+      const net = round2(lines.filter((l: any) => l.DetailType === "SalesItemLineDetail").reduce((s: number, l: any) => s + Number(l.Amount || 0), 0));
+      const detail = v.detail(net);
+      if (!detail) { out.push(`${v.name}: skipped (no tax code)`); continue; }
+      await api(PATH.sale, { Id: doc.id, SyncToken: doc.syncToken, sparse: true, Line: lines, TxnTaxDetail: detail });
+      const after = await reread("sale", doc.id);
+      out.push(`${v.name}: saved. total ${after.total}, tax ${after.tax}${Math.abs(after.tax - target) < 0.011 ? "  <-- WORKS" : ""}`);
+      if (Math.abs(after.tax - target) < 0.011) break;
+    } catch (e) { out.push(`${v.name}: refused. ${e instanceof Error ? e.message : e}`); }
+  }
+  return out;
+}

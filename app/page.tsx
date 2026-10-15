@@ -127,6 +127,36 @@ export default function Home() {
   const canFix = !!st?.writesAllowed;
   const needFix = counts["Needs fix"] || 0;
 
+  const renderTable = (items: { row: Row; v?: Result }[]) => (
+              <table>
+                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">Settlement</th><th className="num">QBO total</th><th className="num">Woo tax</th><th className="num">QBO tax</th><th className="num">TaxDiff</th><th>What will change</th><th /></tr></thead>
+                <tbody>
+                  {items.map(({ row, v }) => v ? (
+                    <Fragment2 key={key(row)} open={open === key(row)} onToggle={() => setOpen(open === key(row) ? null : key(row))}
+                      cells={<>
+                        <td><b>{v.order}</b></td><td>{v.type === "sale" ? "Sale" : "Refund"}</td>
+                        <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span>{v.inDeposit && <span className="chip dep">In deposit</span>}{sectionOf(v) === "other" && v.issues.some((i) => i.field === "Tax") && <span className="chip dep">also tax</span>}</td>
+                        <td className="num">{money(v.settle)}</td><td className="num">{v.qboTotal ? money(v.qboTotal) : "-"}</td>
+                        <td className="num">{money(v.wooTax)}</td><td className="num">{money(v.qboTax)}</td>
+                        <td className="num">{v.status === "Not found" ? "–" : v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
+                        <td className="small">{summary(v)}</td>
+                        <td className="nowrap">
+                          {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button> <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
+                          {v.final === "Skipped" && <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
+                        </td>
+                      </>}
+                      detail={<div>
+                        {v.error && <div className="alert">{v.error}</div>}
+                        {v.message && <p className="small">{v.message}</p>}
+                        {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
+                        {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: Woo {i.woo}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
+                        {v.after && <p className="small">After saving: QuickBooks total {money(v.after.qboTotal)}, tax {money(v.after.qboTax)}, TaxDiff {money(v.after.taxDiff)}.</p>}
+                      </div>} />
+                  ) : null)}
+                </tbody>
+              </table>
+  );
+
   return (
     <main className="wide">
       <header>
@@ -180,33 +210,14 @@ export default function Home() {
               <div className="filters">
                 {["All", ...Object.keys(counts)].map((f) => <button key={f} className={filter === f ? "on" : ""} onClick={() => setFilter(f)}>{f}{f !== "All" ? ` (${counts[f]})` : ""}</button>)}
               </div>
-              <table>
-                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">Settlement</th><th className="num">QBO total</th><th className="num">Woo tax</th><th className="num">QBO tax</th><th className="num">TaxDiff</th><th>What will change</th><th /></tr></thead>
-                <tbody>
-                  {shown.map(({ row, v }) => v ? (
-                    <Fragment2 key={key(row)} open={open === key(row)} onToggle={() => setOpen(open === key(row) ? null : key(row))}
-                      cells={<>
-                        <td><b>{v.order}</b></td><td>{v.type === "sale" ? "Sale" : "Refund"}</td>
-                        <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span>{v.inDeposit && <span className="chip dep">In deposit</span>}</td>
-                        <td className="num">{money(v.settle)}</td><td className="num">{v.qboTotal ? money(v.qboTotal) : "-"}</td>
-                        <td className="num">{money(v.wooTax)}</td><td className="num">{money(v.qboTax)}</td>
-                        <td className="num">{v.status === "Not found" ? "–" : v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
-                        <td className="small">{summary(v)}</td>
-                        <td className="nowrap">
-                          {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button> <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
-                          {v.final === "Skipped" && <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
-                        </td>
-                      </>}
-                      detail={<div>
-                        {v.error && <div className="alert">{v.error}</div>}
-                        {v.message && <p className="small">{v.message}</p>}
-                        {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
-                        {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: Woo {i.woo}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
-                        {v.after && <p className="small">After saving: QuickBooks total {money(v.after.qboTotal)}, tax {money(v.after.qboTax)}, TaxDiff {money(v.after.taxDiff)}.</p>}
-                      </div>} />
-                  ) : null)}
-                </tbody>
-              </table>
+              {(["tax", "other", "rest"] as const).map((sec) => {
+                const items = shown.filter((x) => x.v && sectionOf(x.v) === sec);
+                if (!items.length) return null;
+                const head = sec === "tax" ? ["Tax differences", "Only the tax is different. The fix sets or removes the tax so QuickBooks tax equals Woo tax."]
+                  : sec === "other" ? ["Other differences", "Amount, SKU, price, quantity, shipping, discount, order protection or cold packaging. Rows marked “also tax” have a tax difference too; one fix handles both."]
+                  : ["Matched, needs review, or not found", "No automatic fix for these."];
+                return (<div key={sec} className="sect"><h3>{head[0]} <span className="muted small">({items.length})</span></h3><p className="small muted">{head[1]}</p>{renderTable(items)}</div>);
+              })}
             </>
           )}
         </section>
@@ -237,6 +248,12 @@ export default function Home() {
   );
 }
 
+function sectionOf(v: Result): "tax" | "other" | "rest" {
+  const tax = v.issues.some((i) => i.field === "Tax"), other = v.issues.some((i) => i.field !== "Tax");
+  if (v.status === "Matched" || v.status === "Not found") return "rest";
+  if (other) return "other";
+  return tax ? "tax" : "rest";
+}
 function summary(v: Result) {
   if (v.final === "Corrected, verified") return "Saved and verified";
   const p: string[] = [];
@@ -277,6 +294,30 @@ function Seed() {
       <select value={day} onChange={(e) => setDay(e.target.value)} style={{ width: 200 }}><option value="0909">9 Sep (49 sales)</option><option value="0908">8 Sep (61 sales)</option></select>{" "}
       <button className="btn small" disabled={busy} onClick={run}>{busy ? "Creating…" : "Create test receipts"}</button>
       {log.length > 0 && <pre className="small" style={{ maxHeight: 220, overflow: "auto", background: "#f7f8fa", padding: 10, borderRadius: 8 }}>{log.join("\n")}</pre>}
+      <TaxProbe />
     </section>
+  );
+}
+
+function TaxProbe() {
+  const [order, setOrder] = useState("73199");
+  const [tax, setTax] = useState("5.02");
+  const [log, setLog] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  async function run() {
+    setBusy(true); setLog([]);
+    try { const j = await post("/api/taxprobe", { order, tax: Number(tax) }); setLog(j.log); }
+    catch (e) { setLog([e instanceof Error ? e.message : String(e)]); }
+    setBusy(false);
+  }
+  return (
+    <div style={{ marginTop: 16 }}>
+      <h3>Tax test</h3>
+      <p className="small">Tries different ways of sending a manual tax amount to one sandbox receipt and shows what QuickBooks did with each.</p>
+      <input value={order} onChange={(e) => setOrder(e.target.value)} style={{ width: 110 }} placeholder="order" />{" "}
+      <input value={tax} onChange={(e) => setTax(e.target.value)} style={{ width: 90 }} placeholder="tax" />{" "}
+      <button className="btn small" disabled={busy} onClick={run}>{busy ? "Trying…" : "Try ways to set tax"}</button>
+      {log.length > 0 && <pre className="small" style={{ maxHeight: 260, overflow: "auto", background: "#f7f8fa", padding: 10, borderRadius: 8, whiteSpace: "pre-wrap" }}>{log.join("\n")}</pre>}
+    </div>
   );
 }
