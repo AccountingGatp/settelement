@@ -181,7 +181,7 @@ export default function Home() {
                         <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span>{v.inDeposit && <span className="chip dep">In deposit</span>}</td>
                         <td className="num">{money(v.settle)}</td><td className="num">{v.qboTotal ? money(v.qboTotal) : "-"}</td>
                         <td className="num">{money(v.wooTax)}</td><td className="num">{money(v.qboTax)}</td>
-                        <td className="num">{v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
+                        <td className="num">{v.status === "Not found" ? "–" : v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
                         <td className="small">{summary(v)}</td>
                         <td>{v.status === "Needs fix" && !v.final && <button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button>}</td>
                       </>}

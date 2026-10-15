@@ -49,7 +49,13 @@ function findItem(items: QItem[], l: WLine): QItem | undefined {
 export function reconcile(row: Row, woo: WOrder | null, q: QDoc | null, items: QItem[]): Verdict {
   const v = blank(row);
   if (!woo) { v.status = "Not found"; v.blockers.push("Order not found in WooCommerce."); return v; }
-  if (!q) { v.status = "Not found"; v.blockers.push(`${row.type === "sale" ? "Sales receipt" : "Refund receipt"} not found in QuickBooks.`); return v; }
+  if (!q) {
+    // Not in QuickBooks: nothing is created or changed. Keep the row as it is and show Woo's figures for review.
+    v.status = "Not found"; v.settle = Math.abs(row.amount);
+    if (row.type === "sale") { v.wooTotal = woo.total; v.wooTax = woo.tax; }
+    v.blockers.push(`${row.type === "sale" ? "Sales receipt" : "Refund receipt"} not found in QuickBooks. Nothing was changed; review by hand.`);
+    return v;
+  }
 
   // --- Woo side figures (refunds: use the matching Woo refund)
   let wooTotal = woo.total, wooTax = woo.tax, taxKnown = true;

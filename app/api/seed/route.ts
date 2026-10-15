@@ -32,7 +32,10 @@ export const POST = handler(async (req: Request) => {
   for (const l of usable) {
     if (l === drop) { omitted = `${l.name} (${l.amount.toFixed(2)})`; continue; }
     const it = await ensureItem(l.name, l.sku);
-    lines.push({ itemId: it.id, qty: l.qty, rate: r2(l.amount / (l.qty || 1)), amount: l.amount });
+    const q = l.qty || 1, rate = r2(l.amount / q);
+    // QuickBooks requires Amount = UnitPrice x Qty; when rounding breaks that, send one unit at the full amount
+    if (Math.abs(rate * q - l.amount) < 0.005) lines.push({ itemId: it.id, qty: q, rate, amount: l.amount });
+    else lines.push({ itemId: it.id, qty: 1, rate: l.amount, amount: l.amount });
   }
   const made = await createReceipt("sale", { docNumber: docNumberFor("sale", s.order), customerId: await ensureCustomer("Seed Customer"), date: s.date, lines, totalTax: s.qboTax });
   return {
