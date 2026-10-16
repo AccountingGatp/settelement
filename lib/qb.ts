@@ -1,4 +1,4 @@
-// QuickBooks Online connection + the API calls this tool needs (read receipts, update them, seed the sandbox).
+// QuickBooks Online connection + the API calls this tool needs (read receipts, update them).
 import { kvDel, kvGet, kvSet } from "./store";
 
 export const ENV: "sandbox" | "production" = process.env.QB_ENVIRONMENT === "production" ? "production" : "sandbox";
@@ -206,6 +206,10 @@ export async function reread(kind: Kind, id: string): Promise<QDoc> {
 export type FixPlan = {
   /** tax: leave, set the total tax to a number, or remove tax (all lines non-taxable) */
   tax?: { mode: "set"; total: number } | { mode: "remove" };
+  /** tax amount to be entered by hand later: new lines are made taxable, but no tax figure is sent */
+  taxByHand?: boolean;
+  /** make the shipping line (by its QuickBooks item) non-taxable so QuickBooks recalculates a lower tax */
+  untaxItemId?: string;
   /** lines to add (QBO item already chosen) */
   addLines?: { itemId: string; qty: number; rate: number; amount: number; description?: string }[];
   /** replace ALL item and discount lines with these (Woo's lines); discount:true lines become discount lines */
@@ -218,7 +222,7 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
   const body: any = { Id: doc.id, SyncToken: doc.syncToken, sparse: true };
   let lines: any[] = (raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
   // new lines are taxable when the receipt is meant to carry tax (a tax plan other than "remove", or tax already on it)
-  const newCode = plan.tax?.mode === "remove" ? "NON" : plan.tax || doc.tax > 0 ? "TAX" : "NON";
+  const newCode = plan.tax?.mode === "remove" ? "NON" : plan.tax || plan.taxByHand || doc.tax > 0 ? "TAX" : "NON";
   const itemLine = (a: { itemId: string; qty: number; rate: number; amount: number; description?: string }) => ({
     DetailType: "SalesItemLineDetail", Amount: a.amount, Description: a.description,
     SalesItemLineDetail: { ItemRef: { value: a.itemId }, Qty: a.qty, UnitPrice: a.rate, TaxCodeRef: { value: newCode } },
@@ -230,6 +234,10 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
       lines.push(a.discount ? { DetailType: "DiscountLineDetail", Amount: a.amount, Description: a.description, DiscountLineDetail: { PercentBased: false } } : itemLine(a));
   }
   for (const a of plan.addLines || []) lines.push(itemLine(a));
+  if (plan.untaxItemId) {
+    const i = lines.findIndex((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.ItemRef?.value === plan.untaxItemId);
+    if (i >= 0) lines[i] = { ...lines[i], SalesItemLineDetail: { ...lines[i].SalesItemLineDetail, TaxCodeRef: { value: "NON" } } };
+  }
   if (plan.tax?.mode === "remove") {
     lines = lines.map((l) => (l.DetailType === "SalesItemLineDetail" ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: "NON" } } } : l));
     body.TxnTaxDetail = { TotalTax: 0 };
@@ -241,97 +249,6 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
   }
   body.Line = lines;
   await api(PATH[doc.kind], body);
-}
-
-// ---------------------------------------------------------------- sandbox seeding
-export async function incomeAccountId(): Promise<string> {
-  const key = `qb:income:${ENV}`;
-  const cached = await kvGet<string>(key);
-  if (cached) return cached;
-  const accts = await queryAll("Account", "where Active = true");
-  const a = accts.find((x) => x.AccountSubType === "SalesOfProductIncome") || accts.find((x) => x.AccountType === "Income");
-  if (!a) throw new Error("No income account found in the QuickBooks company.");
-  await kvSet(key, a.Id);
-  return a.Id;
-}
-
-export async function ensureItem(name: string, sku: string): Promise<QItem> {
-  const items = await listItems();
-  const hit = (sku && items.find((i) => i.sku && i.sku.toLowerCase() === sku.toLowerCase())) || items.find((i) => i.name.toLowerCase() === name.toLowerCase());
-  if (hit) {
-    if (hit.active) return hit;
-    assertWritable(); // sandbox seeding only: switch an inactive item back on so it can be used
-    const cur = (await api(`item/${hit.id}`)).Item;
-    await api("item", { Id: cur.Id, SyncToken: cur.SyncToken, Active: true, sparse: true });
-    itemCache = null;
-    return { ...hit, active: true };
-  }
-  assertWritable();
-  const j = await api("item", { Name: name.slice(0, 100), Sku: sku || undefined, Type: "Service", IncomeAccountRef: { value: await incomeAccountId() }, Taxable: false });
-  const it: QItem = { id: j.Item.Id, name: j.Item.Name, sku: j.Item.Sku || "", type: j.Item.Type, active: true };
-  itemCache = null;
-  return it;
-}
-
-export async function ensureCustomer(name: string): Promise<string> {
-  const rows = await queryAll("Customer", `where DisplayName = '${esc(name)}'`);
-  if (rows[0]) return rows[0].Id;
-  assertWritable();
-  return (await api("customer", { DisplayName: name })).Customer.Id;
-}
-
-export async function createReceipt(kind: Kind, p: { docNumber: string; customerId: string; date: string; lines: { itemId: string; qty: number; rate: number; amount: number }[]; totalTax: number }): Promise<QDoc> {
-  assertWritable();
-  const j = await api(PATH[kind], {
-    DocNumber: p.docNumber, TxnDate: p.date, CustomerRef: { value: p.customerId },
-    Line: p.lines.map((l) => ({
-      DetailType: "SalesItemLineDetail", Amount: l.amount,
-      SalesItemLineDetail: { ItemRef: { value: l.itemId }, Qty: l.qty, UnitPrice: l.rate, TaxCodeRef: { value: p.totalTax > 0 ? "TAX" : "NON" } },
-    })),
-    TxnTaxDetail: { TotalTax: p.totalTax },
-  });
-  return view(kind, j[ENTITY[kind]], await listItems());
-}
-
-// ---------------------------------------------------------------- tax probe (SANDBOX ONLY)
-/** Tries several ways of sending a manual tax amount to one sandbox receipt and reports what QuickBooks did with each. */
-export async function probeTax(order: string, target: number): Promise<string[]> {
-  if (ENV !== "sandbox") throw new Error("The tax test only runs on the sandbox company.");
-  assertWritable();
-  const out: string[] = [];
-  const first = await findDoc("sale", order);
-  if (!first) throw new Error(`Receipt for order ${order} was not found in the sandbox.`);
-  try {
-    const p = (await api("preferences")).Preferences?.TaxPrefs || {};
-    out.push(`Company tax settings: UsingSalesTax=${p.UsingSalesTax}, PartnerTaxEnabled=${p.PartnerTaxEnabled} (true means QuickBooks calculates tax itself)`);
-  } catch (e) { out.push(`Could not read tax settings: ${e instanceof Error ? e.message : e}`); }
-  const codes = (await queryAll("TaxCode", "")).filter((c: any) => !["TAX", "NON"].includes(c.Name) && c.SalesTaxRateList?.TaxRateDetail?.[0]);
-  const code = codes[0];
-  out.push(code ? `Tax code used for the variants: ${code.Name} (id ${code.Id}), rate id ${code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value}` : "No named tax code with a rate exists in this company; variants 2 and 3 are skipped.");
-  out.push(`Before: total ${first.total}, tax ${first.tax}. Target tax: ${target}`);
-
-  const variants: { name: string; detail: (net: number) => any | null }[] = [
-    { name: "1. TotalTax only", detail: () => ({ TotalTax: target }) },
-    { name: "2. TotalTax + tax code + tax line", detail: (net) => code && ({ TxnTaxCodeRef: { value: code.Id }, TotalTax: target, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
-    { name: "3. Tax code + tax line, no TotalTax", detail: (net) => code && ({ TxnTaxCodeRef: { value: code.Id }, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
-    { name: "4. TotalTax + UseAutomatedSalesTax=false", detail: () => ({ TotalTax: target, UseAutomatedSalesTax: false }) },
-    { name: "5. Tax code + tax line + UseAutomatedSalesTax=false", detail: (net) => code && ({ UseAutomatedSalesTax: false, TxnTaxCodeRef: { value: code.Id }, TotalTax: target, TaxLine: [{ Amount: target, DetailType: "TaxLineDetail", TaxLineDetail: { TaxRateRef: { value: code.SalesTaxRateList.TaxRateDetail[0].TaxRateRef.value }, PercentBased: false, NetAmountTaxable: net } }] }) },
-  ];
-  for (const v of variants) {
-    try {
-      const doc = await reread("sale", first.id);
-      const lines = (doc.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail").map((l: any) =>
-        l.DetailType === "SalesItemLineDetail" ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: "TAX" } } } : l);
-      const net = round2(lines.filter((l: any) => l.DetailType === "SalesItemLineDetail").reduce((s: number, l: any) => s + Number(l.Amount || 0), 0));
-      const detail = v.detail(net);
-      if (!detail) { out.push(`${v.name}: skipped (no tax code)`); continue; }
-      await api(PATH.sale, { Id: doc.id, SyncToken: doc.syncToken, sparse: true, Line: lines, TxnTaxDetail: detail });
-      const after = await reread("sale", doc.id);
-      out.push(`${v.name}: saved. total ${after.total}, tax ${after.tax}${Math.abs(after.tax - target) < 0.011 ? "  <-- WORKS" : ""}`);
-      if (Math.abs(after.tax - target) < 0.011) break;
-    } catch (e) { out.push(`${v.name}: refused. ${e instanceof Error ? e.message : e}`); }
-  }
-  return out;
 }
 
 
@@ -361,4 +278,11 @@ export function explainFailure(err: unknown, ctx?: { taxStillWrong?: boolean; to
   if (ctx?.taxStillWrong) return "QuickBooks did not take the new tax amount.";
   if (ctx?.totalStillWrong || ctx?.linesStillWrong) return "The receipt still differs from Woo after saving.";
   return "Unknown.";
+}
+
+
+/** Where to open a receipt in the QuickBooks web app. */
+export function qbLink(kind: Kind, id: string): string {
+  const host = ENV === "sandbox" ? "https://app.sandbox.qbo.intuit.com" : "https://app.qbo.intuit.com";
+  return `${host}/app/${kind === "sale" ? "salesreceipt" : "refundreceipt"}?txnId=${encodeURIComponent(id)}`;
 }

@@ -22,8 +22,8 @@ Goes to **Pending review** (never changed): a Woo total that differs from the se
 3. Intuit app → **Development** → Redirect URIs → add the same `QB_REDIRECT_URI`.
 4. Redeploy, log in, **Connect to QuickBooks** (pick the sandbox company).
 
-## Test on the sandbox (development keys)
-1. On the page, **Sandbox only: create test receipts** → pick 9 Sep → creates sandbox receipts for the real Woo orders with the same wrong totals/tax the old books had. Read the log: it says whether QuickBooks accepted the tax value.
+## Test on production (read-only first)
+Set `QB_ENVIRONMENT=production`, production keys and the Production redirect URI, keep `ALLOW_PRODUCTION_WRITES=no`, upload the file and run the check. Set it to `yes` only when ready to fix one receipt.
 2. Upload `9_sep_download.xlsx` → popup should list nothing missing → **Run the check**.
 3. Compare the planned fixes with the old output sheet. Fix **one** receipt, open it in QuickBooks, confirm.
 4. **Fix all that are ready**, then download the report.
@@ -32,10 +32,15 @@ Goes to **Pending review** (never changed): a Woo total that differs from the se
 Switch to Production keys, `QB_ENVIRONMENT=production`, and connect the real company. Writes to a real company stay **blocked** until
 `ALLOW_PRODUCTION_WRITES=yes` is set on purpose. First run it read-only and compare with what the team would do by hand.
 
+## Tax: what is automatic and what is by hand
+- **Woo has no tax, QuickBooks has tax:** the lines are set to non-taxable through the API (not yet proven on the real company; fix one receipt first).
+- **Both have tax, QuickBooks higher, Woo does not tax shipping (the usual case):** the shipping line is made non-taxable through the API, so QuickBooks recalculates tax down to Woo's figure. The row is verified afterwards; if the tax still differs it falls back to by hand.
+- **Any other tax difference (Woo has tax and QuickBooks none, or shipping is not the cause):** the sandbox test showed QuickBooks calculates tax itself and ignores an amount sent through the API. So the app fixes amounts and lines automatically, then shows **Tax to enter by hand** with the figure and an **Open in QuickBooks** link. After you enter it (Edit sales tax, enter manually, apply) click **Check again**; the row turns **Matched** when QuickBooks tax equals Woo tax.
+- Set `TAX_VIA_API=yes` only if a test proves the API takes the amount.
+
 ## Known unknowns (find out on the sandbox)
 - Whether the QuickBooks API honours a manually set tax total on an automatically calculated receipt. If not, saved receipts will fail verification and show **Failed**; tax fixes would then need browser automation.
 - Document numbers: assumes `Woo Order#<n>` and `Woo Refund#<n>` (change `DOC_PREFIX_*` if different).
-- Seeding refunds is not included yet.
 
 ## Local
 ```

@@ -5,11 +5,11 @@ import { parseSettlement } from "@/lib/settlement";
 type Issue = { field: string; woo: string; qbo: string; diff: number; note: string; auto: boolean };
 type Verdict = {
   order: string; type: "sale" | "refund"; customer: string; status: "Matched" | "Needs fix" | "Pending review" | "Not found"; scenario: string;
-  settle: number; wooTotal: number; wooTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
-  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; addLines: { itemName: string; amount: number }[]; replaceLines?: { itemName: string; amount: number; discount?: boolean }[] }; blockers: string[]; notes: string[];
+  link?: string; settle: number; wooTotal: number; wooTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
+  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; addLines: { itemName: string; amount: number }[]; untaxShipping?: { name: string }; replaceLines?: { itemName: string; amount: number; discount?: boolean }[] }; blockers: string[]; notes: string[];
 };
 type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
-type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean };
+type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean; link?: string; taxToEnter?: number };
 type ReadOut = {
   rows: Row[]; skipped: { txnId: string; order: string; status: string; amount: number; reason: string }[]; problems: string[];
   counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[];
@@ -88,13 +88,19 @@ export default function Home() {
     const k = key(row);
     try {
       const j = await post("/api/fix", { row });
-      const fin = j.verified ? "Corrected, verified" : j.refused ? "Failed" : j.applied ? (j.rolledBack ? "Failed, rolled back" : "Failed, check by hand") : "";
-      setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: fin || undefined, after: j.applied ? j.after : undefined, message: j.message, reason: j.reason, rolledBack: j.rolledBack, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
+      const fin = j.verified ? "Corrected, verified" : j.manualTax ? "Tax to enter by hand" : j.refused ? "Failed" : j.applied ? (j.rolledBack ? "Failed, rolled back" : "Failed, check by hand") : "";
+      setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: fin || undefined, after: j.applied ? j.after : undefined, message: j.message, reason: j.reason, rolledBack: j.rolledBack, link: j.link, taxToEnter: j.taxToEnter, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
       return fin;
     } catch (e) {
       setRes((p) => ({ ...p, [k]: { ...p[k], final: "Failed", error: e instanceof Error ? e.message : String(e) } }));
       return "Failed";
     }
+  }
+
+  async function recheckOne(row: Row) {
+    const k = key(row);
+    try { const v = (await post("/api/check", { row })) as Verdict; setRes((p) => ({ ...p, [k]: v })); }
+    catch (e) { setRes((p) => ({ ...p, [k]: { ...p[k], error: e instanceof Error ? e.message : String(e) } })); }
   }
 
   function skipOne(row: Row, on: boolean) {
@@ -162,6 +168,8 @@ export default function Home() {
                         <td className="nowrap">
                           {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button> <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
                           {v.final === "Skipped" && <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
+                          {v.final === "Tax to enter by hand" && <button className="btn small" onClick={(e) => { e.stopPropagation(); recheckOne(row); }}>Check again</button>}
+                          {v.link && v.status !== "Matched" && v.status !== "Not found" && <> <a className="small" href={v.link} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Open in QuickBooks</a></>}
                         </td>
                       </>}
                       detail={<div>
@@ -253,7 +261,6 @@ export default function Home() {
         </section>
       )}
 
-      {st?.connected && st.environment === "sandbox" && <Seed />}
 
       {popup && read && (
         <div className="modal-bg" onClick={() => setPopup(false)}>
@@ -277,8 +284,9 @@ function sectionOf(v: Result): "tax" | "other" | "rest" {
 }
 function summary(v: Result) {
   if (v.final === "Corrected, verified") return "Saved and verified";
+  if (v.final === "Tax to enter by hand") return `Enter tax ${money(v.taxToEnter || 0)} by hand in QuickBooks, then check again`;
   const p: string[] = [];
-  if (v.plan.tax) p.push(v.plan.tax.mode === "remove" ? "Remove tax" : `Set tax to ${money(v.plan.tax.total || 0)}`);
+  if (v.plan.tax) p.push(v.plan.tax.mode === "remove" ? "Remove tax" : v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable (tax should become ${money(v.plan.tax.total || 0)})` : `Set tax to ${money(v.plan.tax.total || 0)} (entered by hand)`);
   v.plan.addLines.forEach((a) => p.push(`Add ${a.itemName} ${money(a.amount)}`));
   if (v.plan.replaceLines) p.push(`Rebuild lines from Woo (${v.plan.replaceLines.length})`);
   if (v.status === "Pending review" || v.status === "Not found") return v.blockers[0] || v.error || "";
@@ -287,58 +295,4 @@ function summary(v: Result) {
 
 function Fragment2({ cells, detail, open, onToggle }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; onToggle: () => void }) {
   return (<><tr onClick={onToggle} style={{ cursor: "pointer" }}>{cells}</tr>{open && <tr className="detail"><td colSpan={10}>{detail}</td></tr>}</>);
-}
-
-function Seed() {
-  const [day, setDay] = useState("0909");
-  const [log, setLog] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  async function run() {
-    setBusy(true); setLog([]);
-    try {
-      const l = await (await fetch(`/api/seed?day=${day}`)).json();
-      let ok = 0, same = 0;
-      for (const order of l.orders as string[]) {
-        try {
-          const j = await post("/api/seed", { day, order });
-          if (j.skipped) setLog((p) => [...p, `${order}: already there`]);
-          else { ok++; if (j.matchesOld) same++; setLog((p) => [...p, `${order}: created, total ${j.got.total} tax ${j.got.tax} (wanted ${j.wanted.total} / ${j.wanted.tax})${j.omitted ? `, left out ${j.omitted}` : ""}${j.matchesOld ? "" : "  ← does not match the old receipt"}`]); }
-        } catch (e) { setLog((p) => [...p, `${order}: ${e instanceof Error ? e.message : e}`]); }
-      }
-      setLog((p) => [...p, `Done: ${ok} created, ${same} match the old receipts exactly.`]);
-    } finally { setBusy(false); }
-  }
-  return (
-    <section className="card sandbox">
-      <h2>Sandbox only: create test receipts</h2>
-      <p className="small">Creates receipts in the QuickBooks <b>sandbox</b> for real Woo orders, with the same wrong totals and tax the old books had, so the check and fixes can be tried safely.</p>
-      <select value={day} onChange={(e) => setDay(e.target.value)} style={{ width: 200 }}><option value="0909">9 Sep (49 sales)</option><option value="0908">8 Sep (61 sales)</option></select>{" "}
-      <button className="btn small" disabled={busy} onClick={run}>{busy ? "Creating…" : "Create test receipts"}</button>
-      {log.length > 0 && <pre className="small" style={{ maxHeight: 220, overflow: "auto", background: "#f7f8fa", padding: 10, borderRadius: 8 }}>{log.join("\n")}</pre>}
-      <TaxProbe />
-    </section>
-  );
-}
-
-function TaxProbe() {
-  const [order, setOrder] = useState("73199");
-  const [tax, setTax] = useState("5.02");
-  const [log, setLog] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  async function run() {
-    setBusy(true); setLog([]);
-    try { const j = await post("/api/taxprobe", { order, tax: Number(tax) }); setLog(j.log); }
-    catch (e) { setLog([e instanceof Error ? e.message : String(e)]); }
-    setBusy(false);
-  }
-  return (
-    <div style={{ marginTop: 16 }}>
-      <h3>Tax test</h3>
-      <p className="small">Tries different ways of sending a manual tax amount to one sandbox receipt and shows what QuickBooks did with each.</p>
-      <input value={order} onChange={(e) => setOrder(e.target.value)} style={{ width: 110 }} placeholder="order" />{" "}
-      <input value={tax} onChange={(e) => setTax(e.target.value)} style={{ width: 90 }} placeholder="tax" />{" "}
-      <button className="btn small" disabled={busy} onClick={run}>{busy ? "Trying…" : "Try ways to set tax"}</button>
-      {log.length > 0 && <pre className="small" style={{ maxHeight: 260, overflow: "auto", background: "#f7f8fa", padding: 10, borderRadius: 8, whiteSpace: "pre-wrap" }}>{log.join("\n")}</pre>}
-    </div>
-  );
 }
