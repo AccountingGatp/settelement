@@ -1,12 +1,13 @@
-// One row, end to end: look up Woo + QBO, compare. Shared by the check and fix routes.
-import { getOrder } from "./woo";
-import { findDoc, listItems } from "./qb";
+// One row, end to end: look up QuickBooks, compare with the file. Shared by the check and fix routes.
+import { findDoc, qbLink } from "./qb";
 import { reconcile, type Verdict } from "./recon";
 import type { Row } from "./settlement";
 
-export async function checkRow(row: Row, freshItems = false): Promise<{ verdict: Verdict; doc: Awaited<ReturnType<typeof findDoc>> }> {
-  const [woo, doc, items] = await Promise.all([getOrder(row.order), findDoc(row.type, row.order), listItems(freshItems)]);
-  return { verdict: reconcile(row, woo, doc, items), doc };
+export async function checkRow(row: Row): Promise<{ verdict: Verdict; doc: Awaited<ReturnType<typeof findDoc>> }> {
+  const doc = await findDoc(row.type, row.order);
+  const verdict = reconcile(row, doc);
+  if (doc) verdict.link = qbLink(row.type, doc.id);
+  return { verdict, doc };
 }
 
 export function parseRow(body: any): Row {

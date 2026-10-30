@@ -17,8 +17,8 @@ const num = (v: unknown) => {
   return Number.isFinite(x) ? Math.round(x * 100) / 100 : 0;
 };
 
-/** The team's output workbook ("main" sheet: Linked Transaction Number, File Amount ...). Only the order numbers, type and
- *  settlement amount are used from it; every other figure is read fresh from Woo and QuickBooks. */
+/** The team's output workbook ("main" sheet: Linked Transaction Number, File Amount ...). The order number, type, file amount and
+ *  the file's tax ("Order Total Tax Amount") are used from it; QuickBooks figures are always read fresh. */
 function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
   const rows: Row[] = [], problems: string[] = [], seen = new Set<string>();
   for (const d of data) {

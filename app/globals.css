@@ -121,3 +121,5 @@ main.wide { max-width: 1100px; }
 .sect h3{margin:0 0 2px}
 
 .chip.Failed{background:#fdecea;color:#b71c1c}
+
+.chip.Tax{background:#fff4e0;color:#8a5a00}

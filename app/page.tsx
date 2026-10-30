@@ -2,11 +2,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { parseSettlement } from "@/lib/settlement";
 
-type Issue = { field: string; woo: string; qbo: string; diff: number; note: string; auto: boolean };
+type Issue = { field: string; file: string; qbo: string; diff: number; note: string; auto: boolean };
 type Verdict = {
   order: string; type: "sale" | "refund"; customer: string; status: "Matched" | "Needs fix" | "Pending review" | "Not found"; scenario: string;
-  link?: string; settle: number; wooTotal: number; wooTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
-  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; addLines: { itemName: string; amount: number }[]; untaxShipping?: { name: string }; replaceLines?: { itemName: string; amount: number; discount?: boolean }[] }; blockers: string[]; notes: string[];
+  link?: string; settle: number; fileTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
+  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; untaxShipping?: { name: string } }; blockers: string[]; notes: string[];
 };
 type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
 type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean; link?: string; taxToEnter?: number };
@@ -67,7 +67,7 @@ export default function Home() {
     if (!read) return;
     cancel.current = false; setErr(""); setRes({});
     let done = 0;
-    setProgress({ done, total: read.rows.length, label: "Checking against Woo and QuickBooks" });
+    setProgress({ done, total: read.rows.length, label: "Checking against QuickBooks" });
     await pool(read.rows, 3, async (row) => {
       try {
         const v = (await post("/api/check", { row })) as Verdict;
@@ -75,20 +75,20 @@ export default function Home() {
       } catch (e) {
         setRes((p) => ({ ...p, [key(row)]: { ...(blankFor(row)), error: e instanceof Error ? e.message : String(e) } }));
       }
-      setProgress({ done: ++done, total: read.rows.length, label: "Checking against Woo and QuickBooks" });
+      setProgress({ done: ++done, total: read.rows.length, label: "Checking against QuickBooks" });
     }, () => cancel.current);
     setProgress(null);
   }
 
   function blankFor(row: Row): Result {
-    return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", settle: row.amount, wooTotal: 0, wooTax: 0, qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false, issues: [], plan: { addLines: [] }, blockers: [], notes: [] };
+    return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", settle: Math.abs(row.amount), fileTax: row.fileTax, qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false, issues: [], plan: {}, blockers: [], notes: [] };
   }
 
   async function fixOne(row: Row): Promise<string> {
     const k = key(row);
     try {
       const j = await post("/api/fix", { row });
-      const fin = j.verified ? "Corrected, verified" : j.manualTax ? "Tax to enter by hand" : j.refused ? "Failed" : j.applied ? (j.rolledBack ? "Failed, rolled back" : "Failed, check by hand") : "";
+      const fin = j.verified ? "Corrected, verified" : j.manualTax ? "Tax to enter by hand" : j.refused ? "Failed" : j.applied ? "Failed, check by hand" : "";
       setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: fin || undefined, after: j.applied ? j.after : undefined, message: j.message, reason: j.reason, rolledBack: j.rolledBack, link: j.link, taxToEnter: j.taxToEnter, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
       return fin;
     } catch (e) {
@@ -129,8 +129,8 @@ export default function Home() {
   function needsPerson() {
     const q = (x: string) => `"${String(x ?? "").replace(/"/g, '""')}"`;
     const rows = Object.values(res).filter((v) => v.final !== "Corrected, verified" && v.status !== "Matched");
-    const head = ["Order", "Type", "Status", "Settlement", "Woo total", "Woo tax", "QBO total", "QBO tax", "TaxDiff", "Change needed", "Reason"];
-    const lines = rows.map((v) => [v.order, v.type, v.final || v.status, money(v.settle), money(v.wooTotal), money(v.wooTax), v.status === "Not found" ? "" : money(v.qboTotal), v.status === "Not found" ? "" : money(v.qboTax), v.status === "Not found" ? "" : money(v.taxDiff),
+    const head = ["Order", "Type", "Status", "File amount", "File tax", "QBO total", "QBO tax", "TaxDiff", "Change needed", "Reason"];
+    const lines = rows.map((v) => [v.order, v.type, v.final || v.status, money(v.settle), money(v.fileTax), v.status === "Not found" ? "" : money(v.qboTotal), v.status === "Not found" ? "" : money(v.qboTax), v.status === "Not found" ? "" : money(v.taxDiff),
       v.final === "Skipped" ? "Skipped: " + summary({ ...v, final: undefined }) : summary(v), [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | ")].map(q).join(","));
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([[head.map(q).join(","), ...lines].join("\n")], { type: "text/csv" })); a.download = "needs-a-person.csv"; a.click();
   }
@@ -154,15 +154,15 @@ export default function Home() {
 
   const renderTable = (items: { row: Row; v?: Result }[]) => (
               <table>
-                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">Settlement</th><th className="num">QBO total</th><th className="num">Woo tax</th><th className="num">QBO tax</th><th className="num">TaxDiff</th><th>What will change</th><th /></tr></thead>
+                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">File amount</th><th className="num">QBO total</th><th className="num">File tax</th><th className="num">QBO tax</th><th className="num">TaxDiff</th><th>What will change</th><th /></tr></thead>
                 <tbody>
                   {items.map(({ row, v }) => v ? (
                     <Fragment2 key={key(row)} open={open === key(row)} onToggle={() => setOpen(open === key(row) ? null : key(row))}
                       cells={<>
                         <td><b>{v.order}</b></td><td>{v.type === "sale" ? "Sale" : "Refund"}</td>
-                        <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span>{v.inDeposit && <span className="chip dep">In deposit</span>}{sectionOf(v) === "other" && v.issues.some((i) => i.field === "Tax") && <span className="chip dep">also tax</span>}</td>
+                        <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span>{v.inDeposit && <span className="chip dep">In deposit</span>}{}</td>
                         <td className="num">{money(v.settle)}</td><td className="num">{v.qboTotal ? money(v.qboTotal) : "-"}</td>
-                        <td className="num">{money(v.wooTax)}</td><td className="num">{money(v.qboTax)}</td>
+                        <td className="num">{money(v.fileTax)}</td><td className="num">{money(v.qboTax)}</td>
                         <td className="num">{v.status === "Not found" ? "–" : v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
                         <td className="small">{summary(v)}</td>
                         <td className="nowrap">
@@ -177,7 +177,7 @@ export default function Home() {
                         {v.message && <p className="small">{v.message}</p>}
                         {v.reason && <p className="small"><b>Reason:</b> {v.reason}</p>}
                         {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
-                        {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: Woo {i.woo}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
+                        {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: File {i.file}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
                         {v.after && <p className="small">After saving: QuickBooks total {money(v.after.qboTotal)}, tax {money(v.after.qboTax)}, TaxDiff {money(v.after.taxDiff)}.</p>}
                       </div>} />
                   ) : null)}
@@ -205,7 +205,7 @@ export default function Home() {
       <section className="card">
         <h2><b>1</b> Upload the settlement file</h2>
         <label className={"drop" + (busy ? " busy" : "")}>
-          {busy || <>Drop the Authorize.net settlement download here or <u>choose a file</u></>}
+          {busy || <>Drop the settlement file here (Authorize.net download or the AuthorizeNet_…_output workbook) or <u>choose a file</u></>}
           <input type="file" hidden accept=".xlsx,.xls,.csv" disabled={!!busy || !st?.connected} onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])} />
         </label>
         {!st?.connected && <p className="small muted">Connect to QuickBooks first.</p>}
@@ -226,7 +226,7 @@ export default function Home() {
 
       {read && read.rows.length > 0 && (
         <section className="card">
-          <h2><b>2</b> Check against Woo and QuickBooks <span className="muted small">(nothing is changed)</span></h2>
+          <h2><b>2</b> Check against QuickBooks <span className="muted small">(nothing is changed)</span></h2>
           <div className="row-actions">
             <button className="btn small" disabled={!!progress} onClick={runChecks}>{Object.keys(res).length ? "Run the check again" : "Run the check"}</button>
             {progress && <button className="btn small ghost" onClick={() => (cancel.current = true)}>Stop</button>}
@@ -242,8 +242,8 @@ export default function Home() {
               {(["tax", "other", "rest"] as const).map((sec) => {
                 const items = shown.filter((x) => x.v && sectionOf(x.v) === sec);
                 if (!items.length) return null;
-                const head = sec === "tax" ? ["Tax differences", "Only the tax is different. The fix sets or removes the tax so QuickBooks tax equals Woo tax."]
-                  : sec === "other" ? ["Other differences", "Amount, SKU, price, quantity, shipping, discount, order protection or cold packaging. Rows marked “also tax” have a tax difference too; one fix handles both."]
+                const head = sec === "tax" ? ["Tax differences", "Only the tax is different. The fix changes the QuickBooks tax to the file's tax (and the total follows)."]
+                  : sec === "other" ? ["Amount differs (not only tax)", "The difference is more than tax, so nothing is changed automatically. Review these by hand."]
                   : ["Matched, needs review, or not found", "No automatic fix for these."];
                 return (<div key={sec} className="sect"><h3>{head[0]} <span className="muted small">({items.length})</span></h3><p className="small muted">{head[1]}</p>{renderTable(items)}</div>);
               })}
@@ -255,7 +255,7 @@ export default function Home() {
       {needFix > 0 && (
         <section className="card">
           <h2><b>3</b> Apply the fixes</h2>
-          <p className="small">{needFix} receipt(s) have a planned fix. Each is re-checked, saved, re-read from QuickBooks and compared with Woo again. Rows that need a person are never changed.</p>
+          <p className="small">{needFix} receipt(s) have a planned fix. Each is re-checked, saved, re-read from QuickBooks and compared with the file again. If it does not match, the receipt is put back. Rows that need a person are never changed.</p>
           <button className="btn" disabled={!canFix || !!progress} onClick={fixAll}>Fix all {needFix} that are ready</button>
           {!canFix && <p className="small muted">Changes are switched off for this QuickBooks company.</p>}
         </section>
@@ -284,13 +284,11 @@ function sectionOf(v: Result): "tax" | "other" | "rest" {
 }
 function summary(v: Result) {
   if (v.final === "Corrected, verified") return "Saved and verified";
-  if (v.final === "Tax to enter by hand") return `Enter tax ${money(v.taxToEnter || 0)} by hand in QuickBooks, then check again`;
-  const p: string[] = [];
-  if (v.plan.tax) p.push(v.plan.tax.mode === "remove" ? "Remove tax" : v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable (tax should become ${money(v.plan.tax.total || 0)})` : `Set tax to ${money(v.plan.tax.total || 0)} (entered by hand)`);
-  v.plan.addLines.forEach((a) => p.push(`Add ${a.itemName} ${money(a.amount)}`));
-  if (v.plan.replaceLines) p.push(`Rebuild lines from Woo (${v.plan.replaceLines.length})`);
+  if (v.final === "Tax to enter by hand") return `Enter tax ${money(v.taxToEnter || 0)} by hand in QuickBooks (Edit sales tax, Apply override), then check again`;
   if (v.status === "Pending review" || v.status === "Not found") return v.blockers[0] || v.error || "";
-  return p.join("; ");
+  if (!v.plan.tax) return "";
+  if (v.plan.tax.mode === "remove") return "Remove tax (untick Taxable on every line)";
+  return v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable (tax should become ${money(v.plan.tax.total || 0)})` : `Set tax to ${money(v.plan.tax.total || 0)}`;
 }
 
 function Fragment2({ cells, detail, open, onToggle }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; onToggle: () => void }) {
