@@ -10,7 +10,7 @@ const near = (a: number, b: number, t = TOL) => Math.abs(a - b) <= t + 1e-9;
 
 export type Issue = { field: string; file: string; qbo: string; diff: number; note: string; auto: boolean };
 export type TaxPlan = { mode: "set"; total: number } | { mode: "remove" };
-export type Plan = { tax?: TaxPlan; untaxShipping?: { itemId: string; name: string } };
+export type Plan = { tax?: TaxPlan; untaxShipping?: { itemId: string; name: string }; preview?: { taxFrom: number; taxTo: number; totalFrom: number; totalTo: number } };
 export type Status = "Matched" | "Needs fix" | "Pending review" | "Not found";
 export type Scenario = "A" | "B" | "C" | "D" | "-";
 
@@ -82,6 +82,7 @@ export function reconcile(row: Row, q: QDoc | null): Verdict {
       const ship = shippingToUntax(q, v.fileTax);
       if (ship) { v.plan.untaxShipping = ship; note = `QuickBooks taxed shipping: make “${ship.name}” non-taxable so the tax becomes the file's tax.`; }
     }
+    v.plan.preview = { taxFrom: q.tax, taxTo: v.scenario === "A" ? 0 : v.fileTax, totalFrom: q.total, totalTo: r2(pre + (v.scenario === "A" ? 0 : v.fileTax)) };
     v.issues.push({ field: "Tax", file: v.fileTax.toFixed(2), qbo: q.tax.toFixed(2), diff: v.taxDiff, note, auto: true });
   }
 

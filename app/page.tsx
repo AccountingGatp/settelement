@@ -6,7 +6,7 @@ type Issue = { field: string; file: string; qbo: string; diff: number; note: str
 type Verdict = {
   order: string; type: "sale" | "refund"; customer: string; status: "Matched" | "Needs fix" | "Pending review" | "Not found"; scenario: string;
   link?: string; settle: number; fileTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
-  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; untaxShipping?: { name: string } }; blockers: string[]; notes: string[];
+  issues: Issue[]; plan: { tax?: { mode: string; total?: number }; untaxShipping?: { name: string }; preview?: { taxFrom: number; taxTo: number; totalFrom: number; totalTo: number } }; blockers: string[]; notes: string[];
 };
 type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
 type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean; link?: string; taxToEnter?: number };
@@ -224,6 +224,8 @@ export default function Home() {
         )}
       </section>
 
+      <Find connected={!!st?.connected} company={st?.companyName || ""} sample={read?.rows[0]?.order} />
+
       {read && read.rows.length > 0 && (
         <section className="card">
           <h2><b>2</b> Check against QuickBooks <span className="muted small">(nothing is changed)</span></h2>
@@ -284,13 +286,39 @@ function sectionOf(v: Result): "tax" | "other" | "rest" {
 }
 function summary(v: Result) {
   if (v.final === "Corrected, verified") return "Saved and verified";
-  if (v.final === "Tax to enter by hand") return `Enter tax ${money(v.taxToEnter || 0)} by hand in QuickBooks (Edit sales tax, Apply override), then check again`;
+  if (v.final === "Tax to enter by hand") return `Enter tax ${money(v.taxToEnter || 0)} by hand in QuickBooks (see the math, edit tax manually, reason: Other, apply override), then check again`;
   if (v.status === "Pending review" || v.status === "Not found") return v.blockers[0] || v.error || "";
   if (!v.plan.tax) return "";
-  if (v.plan.tax.mode === "remove") return "Remove tax (untick Taxable on every line)";
-  return v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable (tax should become ${money(v.plan.tax.total || 0)})` : `Set tax to ${money(v.plan.tax.total || 0)}`;
+  const pv = v.plan.preview, d = pv ? pv.taxTo - pv.taxFrom : 0;
+  const amt = pv ? ` Tax ${money(pv.taxFrom)} → ${money(pv.taxTo)} (${d >= 0 ? "+" : "−"}${money(Math.abs(d))}); total ${money(pv.totalFrom)} → ${money(pv.totalTo)}.` : "";
+  if (v.plan.tax.mode === "remove") return "Remove tax (untick Taxable on every line)." + amt;
+  return (v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable.` : "Override the tax amount.") + amt;
 }
 
 function Fragment2({ cells, detail, open, onToggle }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; onToggle: () => void }) {
   return (<><tr onClick={onToggle} style={{ cursor: "pointer" }}>{cells}</tr>{open && <tr className="detail"><td colSpan={10}>{detail}</td></tr>}</>);
+}
+
+function Find({ connected, company, sample }: { connected: boolean; company: string; sample?: string }) {
+  const [q, setQ] = useState(""), [out, setOut] = useState<{ type: string; docNumber: string; date: string; total: number; customer: string }[] | null>(null), [msg, setMsg] = useState(""), [busy, setBusy] = useState(false);
+  async function go(text: string) {
+    setBusy(true); setMsg(""); setOut(null);
+    try { setOut((await post("/api/find", { q: text })).found); } catch (e) { setMsg(e instanceof Error ? e.message : String(e)); }
+    setBusy(false);
+  }
+  if (!connected) return null;
+  return (
+    <section className="card">
+      <h2>Find an order in <b>{company || "this company"}</b></h2>
+      <p className="small muted">Type an order number to see how QuickBooks numbers it in the connected company. If nothing is found, this is probably not the company that holds the orders: disconnect and connect again, choosing another company on the Intuit screen.</p>
+      <div className="row-actions">
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={sample ? `e.g. ${sample}` : "e.g. 72878"} style={{ padding: 6 }} />
+        <button className="btn small" disabled={busy || !q.trim()} onClick={() => go(q)}>Find</button>
+        {sample && <button className="btn small ghost" disabled={busy} onClick={() => { setQ(sample); go(sample); }}>Try the first order in my file</button>}
+      </div>
+      {msg && <div className="alert">{msg}</div>}
+      {out && (out.length === 0 ? <p className="small">Nothing with that number in {company}. Try another company.</p>
+        : <ul>{out.map((f, i) => <li key={i} className="small"><b>{f.docNumber}</b> ({f.type}) {f.date} {money(f.total)} {f.customer}</li>)}</ul>)}
+    </section>
+  );
 }

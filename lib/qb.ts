@@ -7,9 +7,11 @@ const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 const REVOKE_URL = "https://developer.api.intuit.com/v2/oauth2/tokens/revoke";
 const MINOR = "75";
 
+// "none" means the receipts are numbered with the bare order number and no prefix
+const pre = (v: string | undefined, d: string) => (v === undefined ? d : v.trim().toLowerCase() === "none" ? "" : v);
 export const PREFIX = {
-  sale: process.env.DOC_PREFIX_SALE ?? "Woo Order#",
-  refund: process.env.DOC_PREFIX_REFUND ?? "Woo Refund#",
+  sale: pre(process.env.DOC_PREFIX_SALE, "Woo Order#"),
+  refund: pre(process.env.DOC_PREFIX_REFUND, "Woo Refund#"),
 };
 export type Kind = "sale" | "refund";
 const ENTITY: Record<Kind, string> = { sale: "SalesReceipt", refund: "RefundReceipt" };
@@ -176,6 +178,19 @@ export async function findDoc(kind: Kind, order: string): Promise<QDoc | null> {
   if (!rows.length) return null;
   if (rows.length > 1) throw new Error(`More than one ${ENTITY[kind]} has the number “${dn}”. Check QuickBooks.`);
   return view(kind, rows[0]);
+}
+
+/** Find any transaction whose number contains the text, in the connected company. Used to see what numbers the books really use. */
+export type Found = { type: string; docNumber: string; date: string; total: number; customer: string };
+export async function searchDocs(text: string): Promise<Found[]> {
+  const t = text.replace(/[^A-Za-z0-9#\- ]/g, "").trim();
+  if (!t) return [];
+  const out: Found[] = [];
+  for (const ent of ["SalesReceipt", "RefundReceipt", "Invoice", "CreditMemo"]) {
+    const j = await api(`query?query=${encodeURIComponent(`select * from ${ent} where DocNumber like '%${t}%' maxresults 10`)}`);
+    for (const r of j.QueryResponse?.[ent] || []) out.push({ type: ent, docNumber: r.DocNumber || "", date: r.TxnDate || "", total: round2(Number(r.TotalAmt || 0)), customer: r.CustomerRef?.name || "" });
+  }
+  return out;
 }
 
 /** Re-read straight from QuickBooks (used to verify after a save). */

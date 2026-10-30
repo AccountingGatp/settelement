@@ -46,8 +46,9 @@ function addSheet(wb: ExcelJS.Workbook, name: string, rows: OutRow[], when: "bef
 function changeText(v: OutRow): string {
   const p = v.plan;
   if (!p.tax) return "";
-  if (p.tax.mode === "remove") return "Remove tax (all lines non-taxable)";
-  return p.untaxShipping ? `Make ${p.untaxShipping.name} non-taxable (tax should become ${p.tax.total.toFixed(2)})` : `Set total tax to ${p.tax.total.toFixed(2)}`;
+  const pv = p.preview ? ` | tax ${p.preview.taxFrom.toFixed(2)} → ${p.preview.taxTo.toFixed(2)}, total ${p.preview.totalFrom.toFixed(2)} → ${p.preview.totalTo.toFixed(2)}` : "";
+  if (p.tax.mode === "remove") return "Remove tax (all lines non-taxable)" + pv;
+  return (p.untaxShipping ? `Make ${p.untaxShipping.name} non-taxable` : `Override total tax to ${p.tax.total.toFixed(2)}`) + pv;
 }
 
 export async function buildOutput(rows: OutRow[], account = process.env.DEPOSIT_ACCOUNT || "First Citizen Clearing Account"): Promise<{ buffer: Buffer; filename: string }> {
