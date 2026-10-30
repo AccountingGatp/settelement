@@ -8,7 +8,11 @@ const REVOKE_URL = "https://developer.api.intuit.com/v2/oauth2/tokens/revoke";
 const MINOR = "75";
 
 // "none" means the receipts are numbered with the bare order number and no prefix
-const pre = (v: string | undefined, d: string) => (v === undefined ? d : v.trim().toLowerCase() === "none" ? "" : v);
+const pre = (v: string | undefined, d: string) => {
+  if (v === undefined) return d;
+  const t = v.replace(/^\s*["']|["']\s*$/g, ""); // quotes pasted into the Vercel value are ignored
+  return t.trim().toLowerCase() === "none" ? "" : t;
+};
 export const PREFIX = {
   sale: pre(process.env.DOC_PREFIX_SALE, "Woo Order#"),
   refund: pre(process.env.DOC_PREFIX_REFUND, "Woo Refund#"),
@@ -166,9 +170,19 @@ export async function existingDocNumbers(kind: Kind, docNumbers: string[]): Prom
   for (let i = 0; i < docNumbers.length; i += 40) {
     const chunk = docNumbers.slice(i, i + 40);
     const list = chunk.map((d) => `'${esc(d)}'`).join(",");
-    const rows = await queryAll(ENTITY[kind], `where DocNumber IN (${list})`);
+    const rows = await queryAll(ENTITY[kind], `where DocNumber IN (${list})`).catch(() => []);
     for (const r of rows) found.add(r.DocNumber);
   }
+  // do not trust a miss: look each missing one up on its own, the same way the check does
+  const missing = docNumbers.filter((d) => !found.has(d));
+  let next = 0;
+  await Promise.all(Array.from({ length: 5 }, async () => {
+    while (next < missing.length) {
+      const d = missing[next++];
+      const rows = await queryAll(ENTITY[kind], `where DocNumber = '${esc(d)}'`);
+      if (rows.length) found.add(d);
+    }
+  }));
   return found;
 }
 

@@ -12,7 +12,7 @@ type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: nu
 type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean; link?: string; taxToEnter?: number };
 type ReadOut = {
   rows: Row[]; skipped: { txnId: string; order: string; status: string; amount: number; reason: string }[]; problems: string[];
-  counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[];
+  counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[]; similar?: { type: string; docNumber: string; date: string; total: number; customer: string }[]; lookedFor?: string;
 };
 type St = { connected: boolean; companyName: string; environment: string; writesAllowed: boolean };
 
@@ -269,6 +269,7 @@ export default function Home() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h2>Not found in QuickBooks</h2>
             <p className="small">These {read.missingInQbo.length} order(s) from the file are not in QuickBooks. They will not be created. The other rows can still be checked.</p>
+            {read.similar && read.similar.length > 0 && <div className="alert">Every order is missing, but QuickBooks has {read.similar.map((f) => `“${f.docNumber}”`).join(", ")} for the first order, while the app looked for “{read.lookedFor}”. The number format is different: set <b>DOC_PREFIX_SALE</b> in Vercel to the text before the order number (or <b>none</b> if there is none) and redeploy.</div>}
             <ul>{read.missingInQbo.map((m) => <li key={m.docNumber}>{m.docNumber} <span className="muted">({m.type})</span></li>)}</ul>
             <button className="btn" onClick={() => setPopup(false)}>OK, continue</button>
           </div>

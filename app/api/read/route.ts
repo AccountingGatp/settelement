@@ -1,7 +1,7 @@
 // Step 1: read the settlement file and check that every order exists in QuickBooks.
 import { handler } from "@/lib/route";
 import { parseSettlement } from "@/lib/settlement";
-import { existingDocNumbers, docNumberFor, status } from "@/lib/qb";
+import { existingDocNumbers, docNumberFor, status, searchDocs } from "@/lib/qb";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
@@ -36,5 +36,7 @@ export const POST = handler(async (req: Request) => {
       if (!found.has(dn)) missingInQbo.push({ order: r.order, type, docNumber: dn });
     }
   }
-  return { ...s, missingInQbo };
+  // everything missing usually means a different number format (or another company): show what QuickBooks has for the first order
+  const similar = missingInQbo.length === s.rows.length && s.rows.length > 0 ? await searchDocs(s.rows[0].order).catch(() => []) : [];
+  return { ...s, missingInQbo, similar, lookedFor: missingInQbo[0]?.docNumber || "" };
 });
