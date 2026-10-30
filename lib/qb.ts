@@ -103,18 +103,22 @@ async function conn(): Promise<Conn> {
 async function api(path: string, body?: unknown, using?: Conn): Promise<any> {
   const c = using ?? (await conn());
   const sep = path.includes("?") ? "&" : "?";
-  const r = await fetch(`${API_BASE}/v3/company/${c.realmId}/${path}${sep}minorversion=${MINOR}`, {
-    method: body ? "POST" : "GET",
-    headers: { Authorization: `Bearer ${c.access_token}`, Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-    cache: "no-store",
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok || j.Fault) {
-    const e = j.Fault?.Error?.[0];
-    throw new Error(e ? `${e.Message}${e.Detail ? ": " + e.Detail : ""}` : `QuickBooks error ${r.status}`);
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(`${API_BASE}/v3/company/${c.realmId}/${path}${sep}minorversion=${MINOR}`, {
+      method: body ? "POST" : "GET",
+      headers: { Authorization: `Bearer ${c.access_token}`, Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      cache: "no-store",
+    });
+    // QuickBooks limits how fast it can be called (429): wait and try again
+    if (r.status === 429 && attempt < 5) { await new Promise((ok) => setTimeout(ok, Math.max(Number(r.headers.get("retry-after")) * 1000 || 0, 1500 * 2 ** attempt))); continue; }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.Fault) {
+      const e = j.Fault?.Error?.[0];
+      throw new Error(e ? `${e.Message}${e.Detail ? ": " + e.Detail : ""}` : r.status === 429 ? "QuickBooks is busy (too many requests). Wait a minute and try again." : `QuickBooks error ${r.status}`);
+    }
+    return j;
   }
-  return j;
 }
 
 const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -164,25 +168,16 @@ function view(kind: Kind, raw: any): QDoc {
   };
 }
 
-/** Which of these document numbers exist in QuickBooks? (one query per 40 numbers) */
-export async function existingDocNumbers(kind: Kind, docNumbers: string[]): Promise<Set<string>> {
-  const found = new Set<string>();
-  for (let i = 0; i < docNumbers.length; i += 40) {
-    const chunk = docNumbers.slice(i, i + 40);
-    const list = chunk.map((d) => `'${esc(d)}'`).join(",");
-    const rows = await queryAll(ENTITY[kind], `where DocNumber IN (${list})`).catch(() => []);
-    for (const r of rows) found.add(r.DocNumber);
+/** Which of these document numbers exist in QuickBooks? One paged query for the date window (a few calls in all), then any number
+ *  not seen is looked up on its own, one at a time, so a miss is never a guess and QuickBooks's rate limit is respected. */
+export async function existingDocNumbers(kind: Kind, docNumbers: string[], since?: string): Promise<Set<string>> {
+  const want = new Set(docNumbers), found = new Set<string>();
+  const from = since || new Date(Date.now() - 120 * 864e5).toISOString().slice(0, 10);
+  for (const r of await queryAll(ENTITY[kind], `where TxnDate >= '${from}'`)) if (want.has(r.DocNumber)) found.add(r.DocNumber);
+  for (const d of docNumbers) {
+    if (found.has(d)) continue;
+    if ((await queryAll(ENTITY[kind], `where DocNumber = '${esc(d)}'`)).length) found.add(d);
   }
-  // do not trust a miss: look each missing one up on its own, the same way the check does
-  const missing = docNumbers.filter((d) => !found.has(d));
-  let next = 0;
-  await Promise.all(Array.from({ length: 5 }, async () => {
-    while (next < missing.length) {
-      const d = missing[next++];
-      const rows = await queryAll(ENTITY[kind], `where DocNumber = '${esc(d)}'`);
-      if (rows.length) found.add(d);
-    }
-  }));
   return found;
 }
 

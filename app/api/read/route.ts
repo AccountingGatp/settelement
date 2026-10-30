@@ -30,7 +30,10 @@ export const POST = handler(async (req: Request) => {
   for (const type of ["sale", "refund"] as const) {
     const rows = s.rows.filter((r) => r.type === type);
     if (!rows.length) continue;
-    const found = await existingDocNumbers(type, rows.map((r) => docNumberFor(type, r.order)));
+    // receipts are dated on or before the settlement date: look back 90 days from the earliest date in the file
+    const ds = rows.map((r) => r.date || "").filter((d) => /^\d\d\/\d\d\/\d{4}$/.test(d)).map((d) => `${d.slice(6)}-${d.slice(0, 2)}-${d.slice(3, 5)}`).sort();
+    const since = ds.length ? new Date(new Date(ds[0]).getTime() - 90 * 864e5).toISOString().slice(0, 10) : undefined;
+    const found = await existingDocNumbers(type, rows.map((r) => docNumberFor(type, r.order)), since);
     for (const r of rows) {
       const dn = docNumberFor(type, r.order);
       if (!found.has(dn)) missingInQbo.push({ order: r.order, type, docNumber: dn });

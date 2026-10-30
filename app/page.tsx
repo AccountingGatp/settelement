@@ -68,7 +68,7 @@ export default function Home() {
     cancel.current = false; setErr(""); setRes({});
     let done = 0;
     setProgress({ done, total: read.rows.length, label: "Checking against QuickBooks" });
-    await pool(read.rows, 3, async (row) => {
+    await pool(read.rows, 2, async (row) => {
       try {
         const v = (await post("/api/check", { row })) as Verdict;
         setRes((p) => ({ ...p, [key(row)]: v }));
