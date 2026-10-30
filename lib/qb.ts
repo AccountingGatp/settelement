@@ -168,12 +168,6 @@ function view(kind: Kind, raw: any): QDoc {
   };
 }
 
-/** The document numbers QuickBooks holds for this kind of receipt since a date (one paged query, a few calls in all). */
-export async function scanNumbers(kind: Kind, since?: string): Promise<string[]> {
-  const from = since || new Date(Date.now() - 120 * 864e5).toISOString().slice(0, 10);
-  return (await queryAll(ENTITY[kind], `where TxnDate >= '${from}'`)).map((r) => String(r.DocNumber || ""));
-}
-
 /** If the books number receipts differently from the setting (for example "Order#73102" instead of "Woo Order#73102"),
  *  find the text in front of the order number that most receipts for orders in the file share. */
 export function detectPrefix(numbers: string[], orders: Set<string>): string | null {
@@ -187,10 +181,14 @@ export function detectPrefix(numbers: string[], orders: Set<string>): string | n
   return best;
 }
 
-/** Look up a few numbers one by one (used only for the few not seen in the date window). */
+/** Which of these exact document numbers exist? One small query per 40 numbers, asking for the number only. */
 export async function existingDocNumbers(kind: Kind, docNumbers: string[]): Promise<Set<string>> {
   const found = new Set<string>();
-  for (const d of docNumbers) if ((await queryAll(ENTITY[kind], `where DocNumber = '${esc(d)}'`)).length) found.add(d);
+  for (let i = 0; i < docNumbers.length; i += 40) {
+    const list = docNumbers.slice(i, i + 40).map((d) => `'${esc(d)}'`).join(",");
+    const j = await api(`query?query=${encodeURIComponent(`select DocNumber from ${ENTITY[kind]} where DocNumber IN (${list}) maxresults 1000`)}`);
+    for (const r of j.QueryResponse?.[ENTITY[kind]] || []) found.add(String(r.DocNumber));
+  }
   return found;
 }
 
