@@ -12,7 +12,7 @@ type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: nu
 type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean; link?: string; taxToEnter?: number };
 type ReadOut = {
   rows: Row[]; skipped: { txnId: string; order: string; status: string; amount: number; reason: string }[]; problems: string[];
-  counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[]; similar?: { type: string; docNumber: string; date: string; total: number; customer: string }[]; lookedFor?: string;
+  counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[]; prefix?: Record<string, string>; notes?: string[]; similar?: { type: string; docNumber: string; date: string; total: number; customer: string }[]; lookedFor?: string;
 };
 type St = { connected: boolean; companyName: string; environment: string; writesAllowed: boolean };
 
@@ -63,6 +63,8 @@ export default function Home() {
     setBusy("");
   }
 
+  const withPrefix = (row: Row) => (read?.prefix && read.prefix[row.type] !== undefined ? { ...row, prefix: read.prefix[row.type] } : row);
+
   async function runChecks() {
     if (!read) return;
     cancel.current = false; setErr(""); setRes({});
@@ -70,7 +72,7 @@ export default function Home() {
     setProgress({ done, total: read.rows.length, label: "Checking against QuickBooks" });
     await pool(read.rows, 2, async (row) => {
       try {
-        const v = (await post("/api/check", { row })) as Verdict;
+        const v = (await post("/api/check", { row: withPrefix(row) })) as Verdict;
         setRes((p) => ({ ...p, [key(row)]: v }));
       } catch (e) {
         setRes((p) => ({ ...p, [key(row)]: { ...(blankFor(row)), error: e instanceof Error ? e.message : String(e) } }));
@@ -87,7 +89,7 @@ export default function Home() {
   async function fixOne(row: Row): Promise<string> {
     const k = key(row);
     try {
-      const j = await post("/api/fix", { row });
+      const j = await post("/api/fix", { row: withPrefix(row) });
       const fin = j.verified ? "Corrected, verified" : j.manualTax ? "Tax to enter by hand" : j.refused ? "Failed" : j.applied ? "Failed, check by hand" : "";
       setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: fin || undefined, after: j.applied ? j.after : undefined, message: j.message, reason: j.reason, rolledBack: j.rolledBack, link: j.link, taxToEnter: j.taxToEnter, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
       return fin;
@@ -99,7 +101,7 @@ export default function Home() {
 
   async function recheckOne(row: Row) {
     const k = key(row);
-    try { const v = (await post("/api/check", { row })) as Verdict; setRes((p) => ({ ...p, [k]: v })); }
+    try { const v = (await post("/api/check", { row: withPrefix(row) })) as Verdict; setRes((p) => ({ ...p, [k]: v })); }
     catch (e) { setRes((p) => ({ ...p, [k]: { ...p[k], error: e instanceof Error ? e.message : String(e) } })); }
   }
 
@@ -219,6 +221,7 @@ export default function Home() {
             </div>
             <p className="small muted">Skipped rows are not settled sales or credits: {Object.entries(read.counts).filter(([k]) => k !== "Settled Successfully" && k !== "Credited").map(([k, v]) => `${v} ${k}`).join(", ") || "none"}.</p>
             {read.problems.map((p, i) => <div key={i} className="note">{p}</div>)}
+            {(read.notes || []).map((p, i) => <div key={"n" + i} className="note">{p}</div>)}
             {read.missingInQbo.length > 0 && <div className="alert">{read.missingInQbo.length} order(s) are not in QuickBooks. <button className="link" onClick={() => setPopup(true)}>See the list</button></div>}
           </>
         )}

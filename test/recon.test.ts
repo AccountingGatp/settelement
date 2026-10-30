@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import ExcelJS from "exceljs";
 import { reconcile, scenarioOf } from "../lib/recon";
-import { explainFailure } from "../lib/qb";
+import { explainFailure, detectPrefix } from "../lib/qb";
 import type { QDoc, QLine } from "../lib/qb";
 import type { Row } from "../lib/settlement";
 import { parseSettlement } from "../lib/settlement";
@@ -55,6 +55,11 @@ assert.equal(scenarioOf(5, 0), "D");
 { const q = doc("8", [line("Product", 50)], 4, "refund"); const v = reconcile(row("8", -50, 0, "refund"), q);
   assert.equal(v.status, "Pending review"); assert.equal(v.plan.tax, undefined); }
 { const q = doc("9", [line("Product", 50)], 4, "refund"); assert.equal(reconcile(row("9", -54, 4, "refund"), q).status, "Matched"); }
+
+// prefix detection
+assert.equal(detectPrefix(["Order#73102", "Order#73103", "X9"], new Set(["73102", "73103"])), "Order#");
+assert.equal(detectPrefix(["73102"], new Set(["73102"])), "");
+assert.equal(detectPrefix(["A1"], new Set(["73102"])), null);
 
 // failure reasons
 assert.match(explainFailure(new Error("Stale object error: syncToken")), /Someone changed/);

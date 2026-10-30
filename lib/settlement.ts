@@ -1,7 +1,7 @@
 // Reads the Authorize.net settlement download (xlsx/csv) and keeps only settled sales and credited refunds.
 import * as XLSX from "xlsx";
 
-export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
+export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; prefix?: string };
 export type Skipped = { txnId: string; order: string; status: string; amount: number; reason: string };
 export type Settlement = { rows: Row[]; skipped: Skipped[]; problems: string[]; counts: Record<string, number> };
 

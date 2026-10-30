@@ -20,7 +20,7 @@ export const PREFIX = {
 export type Kind = "sale" | "refund";
 const ENTITY: Record<Kind, string> = { sale: "SalesReceipt", refund: "RefundReceipt" };
 const PATH: Record<Kind, string> = { sale: "salesreceipt", refund: "refundreceipt" };
-export const docNumberFor = (kind: Kind, order: string) => `${PREFIX[kind]}${order}`;
+export const docNumberFor = (kind: Kind, order: string, prefix?: string) => `${prefix ?? PREFIX[kind]}${order}`;
 
 // ---------------------------------------------------------------- OAuth
 function basicAuth() {
@@ -168,21 +168,34 @@ function view(kind: Kind, raw: any): QDoc {
   };
 }
 
-/** Which of these document numbers exist in QuickBooks? One paged query for the date window (a few calls in all), then any number
- *  not seen is looked up on its own, one at a time, so a miss is never a guess and QuickBooks's rate limit is respected. */
-export async function existingDocNumbers(kind: Kind, docNumbers: string[], since?: string): Promise<Set<string>> {
-  const want = new Set(docNumbers), found = new Set<string>();
+/** The document numbers QuickBooks holds for this kind of receipt since a date (one paged query, a few calls in all). */
+export async function scanNumbers(kind: Kind, since?: string): Promise<string[]> {
   const from = since || new Date(Date.now() - 120 * 864e5).toISOString().slice(0, 10);
-  for (const r of await queryAll(ENTITY[kind], `where TxnDate >= '${from}'`)) if (want.has(r.DocNumber)) found.add(r.DocNumber);
-  for (const d of docNumbers) {
-    if (found.has(d)) continue;
-    if ((await queryAll(ENTITY[kind], `where DocNumber = '${esc(d)}'`)).length) found.add(d);
+  return (await queryAll(ENTITY[kind], `where TxnDate >= '${from}'`)).map((r) => String(r.DocNumber || ""));
+}
+
+/** If the books number receipts differently from the setting (for example "Order#73102" instead of "Woo Order#73102"),
+ *  find the text in front of the order number that most receipts for orders in the file share. */
+export function detectPrefix(numbers: string[], orders: Set<string>): string | null {
+  const count = new Map<string, number>();
+  for (const n of numbers) {
+    const m = n.match(/^(.*?)(\d+)$/);
+    if (m && orders.has(m[2])) count.set(m[1], (count.get(m[1]) || 0) + 1);
   }
+  let best: string | null = null, top = 0;
+  for (const [p, c] of count) if (c > top) { best = p; top = c; }
+  return best;
+}
+
+/** Look up a few numbers one by one (used only for the few not seen in the date window). */
+export async function existingDocNumbers(kind: Kind, docNumbers: string[]): Promise<Set<string>> {
+  const found = new Set<string>();
+  for (const d of docNumbers) if ((await queryAll(ENTITY[kind], `where DocNumber = '${esc(d)}'`)).length) found.add(d);
   return found;
 }
 
-export async function findDoc(kind: Kind, order: string): Promise<QDoc | null> {
-  const dn = docNumberFor(kind, order);
+export async function findDoc(kind: Kind, order: string, prefix?: string): Promise<QDoc | null> {
+  const dn = docNumberFor(kind, order, prefix);
   const rows = await queryAll(ENTITY[kind], `where DocNumber = '${esc(dn)}'`);
   if (!rows.length) return null;
   if (rows.length > 1) throw new Error(`More than one ${ENTITY[kind]} has the number “${dn}”. Check QuickBooks.`);
