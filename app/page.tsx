@@ -221,13 +221,10 @@ export default function Home() {
             </div>
             <p className="small muted">Skipped rows are not settled sales or credits: {Object.entries(read.counts).filter(([k]) => k !== "Settled Successfully" && k !== "Credited").map(([k, v]) => `${v} ${k}`).join(", ") || "none"}.</p>
             {read.problems.map((p, i) => <div key={i} className="note">{p}</div>)}
-            {(read.notes || []).map((p, i) => <div key={"n" + i} className="note">{p}</div>)}
             {read.missingInQbo.length > 0 && <div className="alert">{read.missingInQbo.length} order(s) are not in QuickBooks. <button className="link" onClick={() => setPopup(true)}>See the list</button></div>}
           </>
         )}
       </section>
-
-      <Find connected={!!st?.connected} company={st?.companyName || ""} sample={read?.rows[0]?.order} />
 
       {read && read.rows.length > 0 && (
         <section className="card">
@@ -301,28 +298,4 @@ function summary(v: Result) {
 
 function Fragment2({ cells, detail, open, onToggle }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; onToggle: () => void }) {
   return (<><tr onClick={onToggle} style={{ cursor: "pointer" }}>{cells}</tr>{open && <tr className="detail"><td colSpan={10}>{detail}</td></tr>}</>);
-}
-
-function Find({ connected, company, sample }: { connected: boolean; company: string; sample?: string }) {
-  const [q, setQ] = useState(""), [out, setOut] = useState<{ type: string; docNumber: string; date: string; total: number; customer: string }[] | null>(null), [msg, setMsg] = useState(""), [busy, setBusy] = useState(false);
-  async function go(text: string) {
-    setBusy(true); setMsg(""); setOut(null);
-    try { setOut((await post("/api/find", { q: text })).found); } catch (e) { setMsg(e instanceof Error ? e.message : String(e)); }
-    setBusy(false);
-  }
-  if (!connected) return null;
-  return (
-    <section className="card">
-      <h2>Find an order in <b>{company || "this company"}</b></h2>
-      <p className="small muted">Type an order number to see how QuickBooks numbers it in the connected company. If nothing is found, this is probably not the company that holds the orders: disconnect and connect again, choosing another company on the Intuit screen.</p>
-      <div className="row-actions">
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={sample ? `e.g. ${sample}` : "e.g. 72878"} style={{ padding: 6 }} />
-        <button className="btn small" disabled={busy || !q.trim()} onClick={() => go(q)}>Find</button>
-        {sample && <button className="btn small ghost" disabled={busy} onClick={() => { setQ(sample); go(sample); }}>Try the first order in my file</button>}
-      </div>
-      {msg && <div className="alert">{msg}</div>}
-      {out && (out.length === 0 ? <p className="small">Nothing with that number in {company}. Try another company.</p>
-        : <ul>{out.map((f, i) => <li key={i} className="small"><b>{f.docNumber}</b> ({f.type}) {f.date} {money(f.total)} {f.customer}</li>)}</ul>)}
-    </section>
-  );
 }
