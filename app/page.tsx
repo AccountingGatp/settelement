@@ -287,6 +287,7 @@ function sectionOf(v: Result): "tax" | "other" | "rest" {
 }
 function summary(v: Result) {
   if (v.final === "Corrected, verified") return "Saved and verified";
+  if (v.final && v.final.startsWith("Failed") && v.message) return v.message;
   if (v.final === "Tax to enter by hand") return `Enter tax ${money(v.taxToEnter || 0)} by hand in QuickBooks (see the math, edit tax manually, reason: Other, apply override), then check again`;
   if (v.status === "Pending review" || v.status === "Not found") return v.blockers[0] || v.error || "";
   if (!v.plan.tax) return "";
