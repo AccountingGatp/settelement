@@ -225,6 +225,8 @@ export type FixPlan = {
   tax?: { mode: "set"; total: number } | { mode: "remove" };
   /** make the shipping line (by its QuickBooks item) non-taxable so QuickBooks recalculates a lower tax */
   untaxItemId?: string;
+  /** how the tax amount is sent: "total" = only TotalTax (what Intuit documents for automated sales tax), "lines" = TotalTax and the first tax line */
+  style?: "total" | "lines";
 };
 
 export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
@@ -246,11 +248,14 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
   } else if (plan.tax?.mode === "set") {
     const anyTaxable = lines.some((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.TaxCodeRef?.value && l.SalesItemLineDetail.TaxCodeRef.value !== "NON");
     if (!anyTaxable) setCode(() => true, "TAX");
-    const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
-    const gap = round2(plan.tax.total - Number(td.TotalTax || 0));
-    if (Array.isArray(td.TaxLine) && td.TaxLine.length) td.TaxLine[0].Amount = round2(Number(td.TaxLine[0].Amount || 0) + gap); // the whole change goes on the first tax line
-    td.TotalTax = plan.tax.total;
-    body.TxnTaxDetail = td;
+    if (plan.style === "total") body.TxnTaxDetail = { TotalTax: plan.tax.total };
+    else {
+      const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
+      const gap = round2(plan.tax.total - Number(td.TotalTax || 0));
+      if (Array.isArray(td.TaxLine) && td.TaxLine.length) td.TaxLine[0].Amount = round2(Number(td.TaxLine[0].Amount || 0) + gap); // the whole change goes on the first tax line
+      td.TotalTax = plan.tax.total;
+      body.TxnTaxDetail = td;
+    }
   }
   body.Line = lines;
   await api(PATH[doc.kind], body);

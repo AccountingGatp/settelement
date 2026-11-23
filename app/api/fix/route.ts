@@ -19,10 +19,12 @@ export const POST = handler(async (req: Request) => {
   // Ways to reach the file's tax, in order. The first one that verifies wins; each failed one is undone before the next.
   const attempts: FixPlan[] = [];
   if (before.plan.untaxShipping) attempts.push({ untaxItemId: before.plan.untaxShipping.itemId });
-  attempts.push({ tax: target });
+  attempts.push({ tax: target, style: "total" });
+  if (target.mode === "set") attempts.push({ tax: target, style: "lines" });
 
   const original = JSON.parse(JSON.stringify(doc.raw)); // kept so the receipt can be put back
   let cur = doc, wrote = false, lastReason = "", rolledBack = true, rollbackError = "";
+  const tried: string[] = []; // what QuickBooks actually held after each try, to show the person
   for (const plan of attempts) {
     try { await applyFix(cur, plan); wrote = true; }
     catch (e) { lastReason = explainFailure(e); continue; } // QuickBooks refused: nothing was written
@@ -30,6 +32,7 @@ export const POST = handler(async (req: Request) => {
     const after = reconcile(row, again);
     if (verified(after)) return { before, after, verified: true, applied: true, link, message: "Saved and verified: QuickBooks tax and total now match the file." };
     lastReason = explainFailure(null, { taxStillWrong: Math.abs(after.taxDiff) > 0.01, totalStillWrong: Math.abs(after.totalDiff) > 0.01 });
+    tried.push(`${plan.untaxItemId ? "shipping non-taxable" : plan.style === "total" ? "tax amount only" : "tax amount with tax line"}: QuickBooks showed tax ${again.tax.toFixed(2)}, total ${again.total.toFixed(2)} (needed ${after.fileTax.toFixed(2)} and ${after.settle.toFixed(2)})`);
     try { // put the receipt back and check that it really is back
       cur = await restore(row.type, doc.id, original);
       rolledBack = Math.abs(cur.total - doc.total) < 0.011 && Math.abs(cur.tax - doc.tax) < 0.011;
@@ -38,9 +41,9 @@ export const POST = handler(async (req: Request) => {
   }
 
   if (!rolledBack)
-    return { before, after: before, verified: false, applied: true, reason: lastReason, rolledBack: false, rollbackError, link, message: `Not fixed: ${lastReason} The receipt could NOT be put back automatically (${rollbackError}). Open it in QuickBooks and check it.` };
+    return { before, after: before, verified: false, applied: true, reason: lastReason, rolledBack: false, rollbackError, link, tried, message: `Not fixed: ${lastReason} The receipt could NOT be put back automatically (${rollbackError}). Open it in QuickBooks and check it. What happened: ${tried.join("; ")}.` };
   if (target.mode === "set")
     return { before, after: before, verified: false, applied: false, manualTax: true, taxToEnter, reason: lastReason, rolledBack: wrote, link,
-      message: `QuickBooks would not take this tax through the API (${lastReason}). Nothing was left changed. Open the receipt, choose Edit sales tax, enter ${taxToEnter!.toFixed(2)}, Apply override, Save. Then check this row again.` };
-  return { before, after: before, verified: false, applied: false, refused: true, reason: lastReason, rolledBack: wrote, link, message: `Not fixed: ${lastReason}${wrote ? " The receipt was put back to how it was." : " Nothing was changed."}` };
+      tried, message: `QuickBooks would not take this tax through the API (${lastReason}; ${tried.join("; ")}). Nothing was left changed. Open the receipt, choose Edit sales tax, enter ${taxToEnter!.toFixed(2)}, Apply override, Save. Then check this row again.` };
+  return { before, after: before, verified: false, applied: false, refused: true, reason: lastReason, rolledBack: wrote, link, tried, message: `Not fixed: ${lastReason}${wrote ? " The receipt was put back to how it was." : " Nothing was changed."}` };
 });
