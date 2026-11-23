@@ -226,7 +226,7 @@ export type FixPlan = {
   /** make the shipping line (by its QuickBooks item) non-taxable so QuickBooks recalculates a lower tax */
   untaxItemId?: string;
   /** how the tax amount is sent: "total" = only TotalTax (what Intuit documents for automated sales tax), "lines" = TotalTax and the first tax line */
-  style?: "total" | "lines";
+  style?: "total" | "lines" | "delta";
 };
 
 export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
@@ -249,6 +249,17 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
     const anyTaxable = lines.some((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.TaxCodeRef?.value && l.SalesItemLineDetail.TaxCodeRef.value !== "NON");
     if (!anyTaxable) setCode(() => true, "TAX");
     if (plan.style === "total") body.TxnTaxDetail = { TotalTax: plan.tax.total };
+    else if (plan.style === "delta") {
+      // what the QuickBooks screen stores when tax is overridden: the new amount on the tax line, and the difference from the calculated tax in OverrideDeltaAmount
+      const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
+      const gap = round2(plan.tax.total - Number(td.TotalTax || 0));
+      const t0 = Array.isArray(td.TaxLine) ? td.TaxLine[0] : undefined;
+      if (!t0) throw new Error("This receipt has no tax line to override. Enter the tax by hand.");
+      t0.Amount = round2(Number(t0.Amount || 0) + gap);
+      t0.TaxLineDetail = { ...(t0.TaxLineDetail || {}), OverrideDeltaAmount: round2(Number(t0.TaxLineDetail?.OverrideDeltaAmount || 0) + gap) };
+      td.TotalTax = plan.tax.total;
+      body.TxnTaxDetail = td;
+    }
     else {
       const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
       const gap = round2(plan.tax.total - Number(td.TotalTax || 0));

@@ -19,12 +19,12 @@ export const POST = handler(async (req: Request) => {
   // QuickBooks's API cannot be trusted to set an exact tax amount (it ignored it on test receipts, and a rollback then moved the tax).
   // So an exact amount is never written here: the person is told the figure to enter with "Edit sales tax".
   // Written automatically: removing the tax, and making the shipping line non-taxable when that alone gives the file's tax.
-  if (target.mode === "set" && !before.plan.untaxShipping)
+  if (target.mode === "set" && !before.plan.untaxShipping && process.env.TAX_OVERRIDE_API !== "yes")
     return { before, after: before, verified: false, applied: false, manualTax: true, taxToEnter, link, tried: [],
       message: `Nothing was changed. QuickBooks cannot take an exact tax amount from this tool. Open the receipt, choose Edit sales tax (see the math), enter ${taxToEnter!.toFixed(2)}, reason Other, Apply override, Save. Then check this row again.` };
   const attempts: FixPlan[] = [];
   if (before.plan.untaxShipping) attempts.push({ untaxItemId: before.plan.untaxShipping.itemId });
-  else attempts.push({ tax: target });
+  else attempts.push({ tax: target, style: target.mode === "set" ? "delta" : undefined }); // exact amounts only when TAX_OVERRIDE_API=yes (experimental)
 
   const original = JSON.parse(JSON.stringify(doc.raw)); // kept so the receipt can be put back
   let cur = doc, wrote = false, lastReason = "", rolledBack = true, rollbackError = "";
