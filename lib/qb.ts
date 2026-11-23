@@ -272,6 +272,15 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
   await api(PATH[doc.kind], body);
 }
 
+/** Save the receipt's own lines again, unchanged, so QuickBooks recalculates the tax. A tax override stored through the API only shows
+ *  in the totals after a second save (seen on a real receipt: it read 7.22 right after the override, then 6.56 after the next save). */
+export async function recalc(kind: Kind, id: string): Promise<void> {
+  assertWritable();
+  const cur = await reread(kind, id);
+  const lines = (cur.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
+  await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines });
+}
+
 // ---------------------------------------------------------------- rollback and failure reasons
 /** Put a receipt back to what it was before a fix: its original lines and tax detail. Returns the receipt as re-read. */
 export async function restore(kind: Kind, id: string, original: any): Promise<QDoc> {

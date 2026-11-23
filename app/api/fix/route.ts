@@ -2,7 +2,7 @@
 // the receipt is saved, re-read from QuickBooks and compared with the file again. If it does not match, the receipt is put back.
 import { handler } from "@/lib/route";
 import { checkRow, parseRow } from "@/lib/run";
-import { applyFix, assertWritable, reread, restore, explainFailure, qbLink, type FixPlan } from "@/lib/qb";
+import { applyFix, assertWritable, recalc, reread, restore, explainFailure, qbLink, type FixPlan } from "@/lib/qb";
 import { reconcile, verified } from "@/lib/recon";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -30,7 +30,7 @@ export const POST = handler(async (req: Request) => {
   let cur = doc, wrote = false, lastReason = "", rolledBack = true, rollbackError = "";
   const tried: string[] = []; // what QuickBooks actually held after each try, to show the person
   for (const plan of attempts) {
-    try { await applyFix(cur, plan); wrote = true; }
+    try { await applyFix(cur, plan); wrote = true; if (plan.style === "delta") await recalc(row.type, doc.id); }
     catch (e) { lastReason = explainFailure(e); continue; } // QuickBooks refused: nothing was written
     const again = await reread(row.type, doc.id);
     const after = reconcile(row, again);
