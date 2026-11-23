@@ -16,11 +16,15 @@ export const POST = handler(async (req: Request) => {
   const link = qbLink(row.type, doc.id);
   const target = before.plan.tax;
   const taxToEnter = target.mode === "set" ? target.total : undefined;
-  // Ways to reach the file's tax, in order. The first one that verifies wins; each failed one is undone before the next.
+  // QuickBooks's API cannot be trusted to set an exact tax amount (it ignored it on test receipts, and a rollback then moved the tax).
+  // So an exact amount is never written here: the person is told the figure to enter with "Edit sales tax".
+  // Written automatically: removing the tax, and making the shipping line non-taxable when that alone gives the file's tax.
+  if (target.mode === "set" && !before.plan.untaxShipping)
+    return { before, after: before, verified: false, applied: false, manualTax: true, taxToEnter, link, tried: [],
+      message: `Nothing was changed. QuickBooks cannot take an exact tax amount from this tool. Open the receipt, choose Edit sales tax (see the math), enter ${taxToEnter!.toFixed(2)}, reason Other, Apply override, Save. Then check this row again.` };
   const attempts: FixPlan[] = [];
   if (before.plan.untaxShipping) attempts.push({ untaxItemId: before.plan.untaxShipping.itemId });
-  attempts.push({ tax: target, style: "total" });
-  if (target.mode === "set") attempts.push({ tax: target, style: "lines" });
+  else attempts.push({ tax: target });
 
   const original = JSON.parse(JSON.stringify(doc.raw)); // kept so the receipt can be put back
   let cur = doc, wrote = false, lastReason = "", rolledBack = true, rollbackError = "";

@@ -267,8 +267,9 @@ export async function restore(kind: Kind, id: string, original: any): Promise<QD
   assertWritable();
   const cur = await reread(kind, id);
   const lines = (original.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
+  // Only the lines (their tax codes) are put back. The old tax detail is NOT sent: QuickBooks treats a tax amount sent back as an override
+  // and the total tax drifted on a test receipt. With the lines restored, QuickBooks works the tax out itself again.
   const body: any = { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines };
-  if (original.TxnTaxDetail) body.TxnTaxDetail = original.TxnTaxDetail;
   await api(PATH[kind], body);
   return reread(kind, id);
 }
