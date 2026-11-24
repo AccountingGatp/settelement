@@ -25,7 +25,12 @@ If the cookie is cleared, connect again.
 ## First test on the real company
 1. `QB_ENVIRONMENT=production`, production keys, `ALLOW_PRODUCTION_WRITES=no`. Connect, upload the file, run the check. Nothing is changed.
 2. Set `ALLOW_PRODUCTION_WRITES=yes`, fix one receipt, open it in QuickBooks and confirm. Then use Fix all.
-3. If QuickBooks will not take a tax amount through its API, the row shows **Tax to enter by hand** with the figure (Edit sales tax → enter it → Apply override → Save), then **Check again**.
+3. How a tax difference is fixed, in order (each step is saved, saved once more so QuickBooks recalculates, re-read and compared with the file; a step that does not match is undone before the next):
+   - file has no tax: all lines made non-taxable;
+   - surplus tax that could be tax on shipping: the shipping line made non-taxable;
+   - otherwise the exact tax is written the way the *See the math* override screen stores it (new amount on the tax lines plus the override difference), up to 3 corrections.
+   If none works the row shows **Tax to enter by hand** with the figure (Edit sales tax → enter it → Apply override → Save), then **Check again**.
+   Set `TAX_OVERRIDE_API=no` to switch the exact-amount step off. **Fix all** stops at the first receipt that could not be put back.
 
 ## Develop
 `npm install`, `npm test`, `npm run dev`.

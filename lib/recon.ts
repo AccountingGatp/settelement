@@ -35,15 +35,14 @@ export function scenarioOf(fileTax: number, qboTax: number): Scenario {
   return "B";
 }
 
-/** QuickBooks taxed the shipping line: if making only that line non-taxable brings the tax to the file's figure, return that line. */
+/** QuickBooks probably taxed the shipping line: the surplus tax is small and no bigger than a tax rate on the shipping charge.
+ *  Return that line so the fix can make it non-taxable (the fix is verified afterwards and undone if it does not give the file's tax).
+ *  Shipping may be the QuickBooks shipping field (item SHIPPING_ITEM_ID), which often carries no tax code at all. */
 function shippingToUntax(q: QDoc, fileTax: number): { itemId: string; name: string } | undefined {
-  const ship = q.lines.find((l) => l.kind === "item" && !!l.itemId && !!l.taxCode && l.taxCode !== "NON" && /ship|freight|deliver/i.test(l.name));
-  if (!ship) return undefined;
-  const taxable = q.lines.filter((l) => l.taxCode && l.taxCode !== "NON");
-  const base = taxable.reduce((t, l) => t + (l.kind === "discount" ? -l.amount : l.kind === "item" ? l.amount : 0), 0);
-  if (base <= TOL) return undefined;
-  const shipTax = r2(ship.amount * (q.tax / base));
-  return near(r2(q.tax - shipTax), fileTax, 0.02) ? { itemId: ship.itemId, name: ship.name || "Shipping" } : undefined;
+  const ship = q.lines.find((l) => l.kind === "item" && !!l.itemId && l.taxCode !== "NON" && (l.itemId === "SHIPPING_ITEM_ID" || /ship|freight|deliver/i.test(l.name)));
+  if (!ship || ship.amount <= TOL) return undefined;
+  const surplus = r2(q.tax - fileTax);
+  return surplus > TOL && surplus <= ship.amount * 0.2 ? { itemId: ship.itemId, name: ship.name || "Shipping" } : undefined;
 }
 
 export function reconcile(row: Row, q: QDoc | null): Verdict {

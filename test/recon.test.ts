@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import ExcelJS from "exceljs";
 import { reconcile, scenarioOf } from "../lib/recon";
-import { explainFailure, detectPrefix } from "../lib/qb";
+import { explainFailure, detectPrefix, retargetTax } from "../lib/qb";
 import type { QDoc, QLine } from "../lib/qb";
 import type { Row } from "../lib/settlement";
 import { parseSettlement } from "../lib/settlement";
@@ -33,6 +33,11 @@ assert.equal(scenarioOf(5, 0), "D");
   assert.equal(v.status, "Needs fix"); assert.equal(v.scenario, "B"); assert.equal(v.taxDiff, -0.99);
   assert.deepEqual(v.plan.tax, { mode: "set", total: 4.05 }); assert.equal(v.plan.untaxShipping?.name, "Shipping"); }
 
+// B: real 85153 shape: discount line, shipping is QuickBooks's shipping field with no tax code, surplus tax 0.91 = tax on shipping
+{ const q: QDoc = { kind: "sale", id: "q85153", syncToken: "0", docNumber: "Woo Order#85153", total: 108.47, tax: 7.24, inDeposit: false, customer: "X", raw: {}, lines: [line("Gas Money", 47.49), line("Orange", 47.49), { kind: "discount", itemId: "", name: "Discount", qty: 0, rate: 0, amount: 4.74, taxCode: "" }, { kind: "item", itemId: "SHIPPING_ITEM_ID", name: "Shipping", qty: 1, rate: 10.99, amount: 10.99, taxCode: "" }] };
+  const v = reconcile(row("85153", 107.56, 6.33), q);
+  assert.equal(v.status, "Needs fix"); assert.equal(v.plan.untaxShipping?.itemId, "SHIPPING_ITEM_ID"); }
+
 // B: QBO tax higher but shipping does not explain it -> plain set (override)
 { const q = doc("3", [line("Product", 60)], 5.94); const v = reconcile(row("3", 65.01, 5.01), q);
   assert.equal(v.status, "Needs fix"); assert.equal(v.plan.untaxShipping, undefined); assert.deepEqual(v.plan.tax, { mode: "set", total: 5.01 }); }
@@ -60,6 +65,14 @@ assert.equal(scenarioOf(5, 0), "D");
 assert.equal(detectPrefix(["Order#73102", "Order#73103", "X9"], new Set(["73102", "73103"])), "Order#");
 assert.equal(detectPrefix(["73102"], new Set(["73102"])), "");
 assert.equal(detectPrefix(["A1"], new Set(["73102"])), null);
+
+// tax override: new total is spread over the tax lines, differences recorded as override amounts
+{ const td = { TotalTax: 7.24, TaxLine: [{ Amount: 4.0, TaxLineDetail: { OverrideDeltaAmount: 0 } }, { Amount: 3.24, TaxLineDetail: {} }] };
+  const t = retargetTax(td, 6.33);
+  assert.equal(t.TotalTax, 6.33); assert.equal(Math.round((t.TaxLine[0].Amount + t.TaxLine[1].Amount) * 100) / 100, 6.33);
+  assert.equal(Math.round((t.TaxLine[0].TaxLineDetail.OverrideDeltaAmount + t.TaxLine[1].TaxLineDetail.OverrideDeltaAmount) * 100) / 100, -0.91);
+  assert.equal(td.TaxLine[0].Amount, 4.0); // the input is not changed
+  assert.throws(() => retargetTax({ TotalTax: 1 }, 2), /no tax line/); }
 
 // failure reasons
 assert.match(explainFailure(new Error("Stale object error: syncToken")), /Someone changed/);

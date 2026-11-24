@@ -226,7 +226,7 @@ export type FixPlan = {
   /** make the shipping line (by its QuickBooks item) non-taxable so QuickBooks recalculates a lower tax */
   untaxItemId?: string;
   /** how the tax amount is sent: "total" = only TotalTax (what Intuit documents for automated sales tax), "lines" = TotalTax and the first tax line */
-  style?: "total" | "lines" | "delta";
+  style?: "total" | "lines";
 };
 
 export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
@@ -249,17 +249,6 @@ export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
     const anyTaxable = lines.some((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.TaxCodeRef?.value && l.SalesItemLineDetail.TaxCodeRef.value !== "NON");
     if (!anyTaxable) setCode(() => true, "TAX");
     if (plan.style === "total") body.TxnTaxDetail = { TotalTax: plan.tax.total };
-    else if (plan.style === "delta") {
-      // what the QuickBooks screen stores when tax is overridden: the new amount on the tax line, and the difference from the calculated tax in OverrideDeltaAmount
-      const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
-      const gap = round2(plan.tax.total - Number(td.TotalTax || 0));
-      const t0 = Array.isArray(td.TaxLine) ? td.TaxLine[0] : undefined;
-      if (!t0) throw new Error("This receipt has no tax line to override. Enter the tax by hand.");
-      t0.Amount = round2(Number(t0.Amount || 0) + gap);
-      t0.TaxLineDetail = { ...(t0.TaxLineDetail || {}), OverrideDeltaAmount: round2(Number(t0.TaxLineDetail?.OverrideDeltaAmount || 0) + gap) };
-      td.TotalTax = plan.tax.total;
-      body.TxnTaxDetail = td;
-    }
     else {
       const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
       const gap = round2(plan.tax.total - Number(td.TotalTax || 0));
@@ -281,17 +270,52 @@ export async function recalc(kind: Kind, id: string): Promise<void> {
   await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines });
 }
 
+/** Spread a new total tax over the receipt's tax lines (in proportion to what each holds) and record the difference on each line as the
+ *  override amount, which is what the QuickBooks screen stores when tax is overridden with "See the math". Pure: easy to test. */
+export function retargetTax(td: any, target: number): any {
+  const t = JSON.parse(JSON.stringify(td || {}));
+  const lines: any[] = Array.isArray(t.TaxLine) ? t.TaxLine : [];
+  if (!lines.length) throw new Error("This receipt has no tax line to override. Enter the tax by hand.");
+  const sum = lines.reduce((a, l) => a + Number(l.Amount || 0), 0);
+  let left = target;
+  lines.forEach((l, i) => {
+    const old = Number(l.Amount || 0);
+    const n = i === lines.length - 1 ? left : round2(sum > 0 ? (old / sum) * target : target / lines.length);
+    left = round2(left - n);
+    l.Amount = n;
+    l.TaxLineDetail = { ...(l.TaxLineDetail || {}), OverrideDeltaAmount: round2(Number(l.TaxLineDetail?.OverrideDeltaAmount || 0) + (n - old)) };
+  });
+  t.TotalTax = target;
+  return t;
+}
+
+/** Set the total tax of a receipt to an exact amount through the API, then check it by re-reading. A tax override only shows in the
+ *  totals after a second save, so each round is: write, save again, read. Up to 3 rounds, each correcting what QuickBooks reports. */
+export async function overrideTax(kind: Kind, id: string, target: number): Promise<QDoc> {
+  assertWritable();
+  let cur = await reread(kind, id);
+  for (let round = 0; round < 3 && Math.abs(cur.tax - target) > 0.005; round++) {
+    const lines = (cur.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
+    await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines, TxnTaxDetail: retargetTax(cur.raw.TxnTaxDetail, target) });
+    await recalc(kind, id);
+    cur = await reread(kind, id);
+  }
+  return cur;
+}
+
 // ---------------------------------------------------------------- rollback and failure reasons
-/** Put a receipt back to what it was before a fix: its original lines and tax detail. Returns the receipt as re-read. */
+/** Put a receipt back to what it was before a fix: its original lines, then its original total tax (worked out the same way as an override,
+ *  so a tax that was overridden before stays as it was). Returns the receipt as re-read. */
 export async function restore(kind: Kind, id: string, original: any): Promise<QDoc> {
   assertWritable();
   const cur = await reread(kind, id);
   const lines = (original.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
-  // Only the lines (their tax codes) are put back. The old tax detail is NOT sent: QuickBooks treats a tax amount sent back as an override
-  // and the total tax drifted on a test receipt. With the lines restored, QuickBooks works the tax out itself again.
-  const body: any = { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines };
-  await api(PATH[kind], body);
-  return reread(kind, id);
+  await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines });
+  await recalc(kind, id);
+  const back = await reread(kind, id);
+  const wasTax = round2(Number(original.TxnTaxDetail?.TotalTax || 0));
+  if (Math.abs(back.tax - wasTax) <= 0.005) return back;
+  try { return await overrideTax(kind, id, wasTax); } catch { return back; }
 }
 
 /** A short, plain reason for a failed fix, from QuickBooks's message. */

@@ -121,6 +121,7 @@ export default function Home() {
     await pool(todo, 1, async (row) => {
       const f = await fixOne(row);
       setProgress({ done: ++done, total: todo.length, label: "Fixing" });
+      if (f === "Failed, check by hand") { cancel.current = true; setErr("Stopped: a receipt could not be put back automatically. Open it in QuickBooks and check it before going on."); }
       failsInARow = f.startsWith("Failed") ? failsInARow + 1 : 0;
       if (failsInARow >= 3) { cancel.current = true; setErr("Stopped: 3 fixes in a row failed. Look at the failed rows before going on."); }
     }, () => cancel.current);
