@@ -100,6 +100,10 @@ async function conn(): Promise<Conn> {
 }
 
 // ---------------------------------------------------------------- raw API
+export class QuickBooksError extends Error {
+  constructor(message: string, readonly code: string, readonly traceId: string) { super(message); }
+}
+
 async function api(path: string, body?: unknown, using?: Conn): Promise<any> {
   const c = using ?? (await conn());
   const sep = path.includes("?") ? "&" : "?";
@@ -115,7 +119,9 @@ async function api(path: string, body?: unknown, using?: Conn): Promise<any> {
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.Fault) {
       const e = j.Fault?.Error?.[0];
-      throw new Error(e ? `${e.Message}${e.Detail ? ": " + e.Detail : ""}` : r.status === 429 ? "QuickBooks is busy (too many requests). Wait a minute and try again." : `QuickBooks error ${r.status}`);
+      const message = e ? `${e.Message}${e.Detail ? ": " + e.Detail : ""}` : r.status === 429
+        ? "QuickBooks is busy (too many requests). Wait a minute and try again." : `QuickBooks error ${r.status}`;
+      throw new QuickBooksError(message, String(e?.code || r.status), r.headers.get("intuit_tid") || "");
     }
     return j;
   }
@@ -264,7 +270,9 @@ export function sameReceiptLines(a: QDoc, b: QDoc): boolean {
 
 export function applyTaxStep(doc: QDoc, baseline: QDoc, step: FixStep, adjustment?: Adjustment): Promise<QDoc> {
   const td = totalTaxDetail(baseline, step.tax);
-  if (step.kind === "total" && !adjustment && sameReceiptLines(doc, baseline)) return saveReceipt(doc, { TxnTaxDetail: td });
+  // The settlement tax is the full tax, including any shipping tax.
+  const taxOverride = { ShippingTaxIncludedInTotalTax: true, TxnTaxDetail: td };
+  if (step.kind === "total" && !adjustment && sameReceiptLines(doc, baseline)) return saveReceipt(doc, taxOverride);
   const lines = receiptLines(baseline).map((line) => {
     if (!line.SalesItemLineDetail) return line;
     if (step.kind === "remove" || (step.kind === "shipping" && line.SalesItemLineDetail.ItemRef?.value === step.shippingId)) {
@@ -285,14 +293,18 @@ export function applyTaxStep(doc: QDoc, baseline: QDoc, step: FixStep, adjustmen
     });
   }
   const sourceTax = doc.raw.TxnTaxDetail?.TaxLine?.length ? doc.raw.TxnTaxDetail : baseline.raw.TxnTaxDetail;
-  return saveReceipt(doc, { Line: lines, TxnTaxDetail: step.kind === "override" ? retargetTax(sourceTax, step.tax) : td });
+  return saveReceipt(doc, {
+    ...taxOverride, Line: lines,
+    TxnTaxDetail: step.kind === "override" ? retargetTax(sourceTax, step.tax) : td,
+  });
 }
 
-export function restore(doc: QDoc, original: QDoc, exactDetail: boolean): Promise<QDoc> {
-  const detail = exactDetail ? original.raw.TxnTaxDetail : totalTaxDetail(original, original.tax);
+export function restore(doc: QDoc, original: QDoc): Promise<QDoc> {
+  const detail = original.raw.TxnTaxDetail || { TotalTax: original.tax };
   return saveReceipt(doc, {
     ...(sameReceiptLines(doc, original) ? {} : { Line: receiptLines(original) }),
-    TxnTaxDetail: detail || { TotalTax: 0 },
+    ShippingTaxIncludedInTotalTax: true,
+    TxnTaxDetail: detail,
   });
 }
 

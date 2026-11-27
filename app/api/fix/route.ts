@@ -1,6 +1,6 @@
 import { handler } from "@/lib/route";
 import { checkRow, parseRow } from "@/lib/run";
-import { applyTaxStep, assertWritable, reread, restore, sameReceiptLines, explainFailure, qbLink, type FixStep, type QDoc } from "@/lib/qb";
+import { applyTaxStep, assertWritable, reread, restore, sameReceiptLines, explainFailure, qbLink, QuickBooksError, type FixStep, type QDoc } from "@/lib/qb";
 import { reconcile, sameMoney, verified } from "@/lib/recon";
 
 export const dynamic = "force-dynamic";
@@ -14,9 +14,8 @@ export const POST = handler(async (req: Request) => {
     return { before, after: before, verified: false, applied: false, message: `Current QuickBooks status is “${before.status}”.` };
   }
 
-  const originalDoc = doc;
-  const receiptId = doc.id;
-  const link = qbLink(row.type, receiptId);
+  const original = doc;
+  const link = qbLink(row.type, original.id);
   const tax = before.fileTax;
   const adjustment = before.plan.adjustment;
   const shipping = before.plan.untaxShipping;
@@ -24,72 +23,88 @@ export const POST = handler(async (req: Request) => {
   if (process.env.TAX_OVERRIDE_API !== "no") {
     if (!adjustment) steps.push({ kind: "total", tax });
     steps.push({ kind: "lines", tax });
-    if (doc.raw.TxnTaxDetail?.TaxLine?.length) steps.push({ kind: "override", tax });
+    if (original.raw.TxnTaxDetail?.TaxLine?.length) steps.push({ kind: "override", tax });
   } else if (adjustment && !before.plan.tax) {
     steps.push({ kind: "lines", tax });
   }
   if (shipping) steps.push({ kind: "shipping", tax, shippingId: shipping.itemId });
   if (before.plan.tax?.mode === "remove") steps.push({ kind: "remove", tax });
 
-  let current = doc;
-  let observed = doc;
-  let saved = false;
-  let rollbackError = "";
-  let compensated = false;
   const tried: string[] = [];
+  let observed = original;
+  let current = original;
+  let changed = false;
+  let unconfirmed = false;
+  let lastIssue = "";
+  let compensated = false;
   const view = (receipt: QDoc) => ({ ...reconcile(row, receipt, adjustment), link });
-  const adjustedAmount = (receipt: QDoc) => receipt.lines
+  const adjustmentTotal = (receipt: QDoc) => receipt.lines
     .filter((line) => line.itemId === adjustment?.id && line.taxCode === "NON")
     .reduce((sum, line) => sum + line.amount, 0);
-  const correct = (after: ReturnType<typeof view>) => verified(after) && (!adjustment ||
-    sameMoney(adjustedAmount(observed) - adjustedAmount(originalDoc), adjustment.amount));
+  const originalValues = (receipt: QDoc) => sameMoney(receipt.tax, original.tax) &&
+    sameMoney(receipt.total, original.total) && sameReceiptLines(receipt, original);
 
   async function readCurrent() {
-    observed = await reread(row.type, receiptId);
-    if (observed.syncToken !== current.syncToken) throw new Error("The receipt changed during the update.");
-    return observed;
+    observed = await reread(row.type, original.id);
+    if (String(observed.syncToken) !== String(current.syncToken)) throw new Error("QuickBooks returned a different receipt version. Check the current receipt.");
   }
 
-  for (const step of steps) {
+  function recordError(step: string, error: unknown) {
+    const trace = error instanceof QuickBooksError ? [error.code, error.traceId].filter(Boolean).join(" / ") : "";
+    lastIssue = explainFailure(error);
+    tried.push(`${step}: ${lastIssue}${trace ? ` [${trace}]` : ""}`);
+    console.warn("settlement.quickbooks.failure", { step, type: row.type, code: error instanceof QuickBooksError ? error.code : undefined, trace });
+  }
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    let roundingDifference = 0;
     try {
-      current = await applyTaxStep(current, doc, step, adjustment);
-      saved = true;
-      let after = view(await readCurrent());
-      const diff = after.taxDiff ?? 0;
-      if (!compensated && !correct(after) && tax > 0 && Math.abs(diff) === 0.01 && diff === after.totalDiff) {
-        compensated = true;
-        current = await applyTaxStep(current, doc, { ...step, tax: Math.round((tax + diff) * 100) / 100 }, adjustment);
-        after = view(await readCurrent());
+      current = await applyTaxStep(current, original, step, adjustment);
+      await readCurrent();
+      const after = view(observed);
+      if (verified(after) && (!adjustment || sameMoney(adjustmentTotal(observed) - adjustmentTotal(original), adjustment.amount))) {
+        return { before, after, verified: true, applied: true, link, message: "Tax and total saved and verified." };
       }
-      if (correct(after)) return { before, after, verified: true, applied: true, link, message: "Tax and total saved and verified." };
-      tried.push(`${step.kind} left tax ${observed.tax.toFixed(2)} and total ${observed.total.toFixed(2)}`);
+      if (tax > 0 && after.taxDiff === after.totalDiff && Math.abs(after.totalDiff) === 0.01) roundingDifference = after.totalDiff;
+      lastIssue = `QuickBooks returned tax ${observed.tax.toFixed(2)} and total ${observed.total.toFixed(2)}.`;
+      tried.push(`${step.kind}: ${lastIssue}`);
     } catch (error) {
-      tried.push(`${step.kind}: ${explainFailure(error)}`);
+      recordError(step.kind, error);
       try { await readCurrent(); }
-      catch (readError) { rollbackError = explainFailure(readError); break; }
+      catch (readError) { recordError("verify", readError); unconfirmed = true; break; }
     }
-  }
 
-  const original = (receipt: QDoc) => sameMoney(receipt.tax, doc.tax) && sameMoney(receipt.total, doc.total) && sameReceiptLines(receipt, doc);
-  if (!rollbackError && saved && !original(observed)) {
-    try {
-      // Try all compatible corrections before restoring. QBO can recalculate a receipt on any line write.
-      for (const exactDetail of [false, true]) {
-        current = await restore(current, doc, exactDetail);
-        if (original(await readCurrent())) break;
+    // Only try another update if QuickBooks still has the original figures and lines.
+    if (!originalValues(observed)) {
+      changed = true;
+      try {
+        current = await restore(current, original);
+        await readCurrent();
+        unconfirmed = !originalValues(observed);
+      } catch (error) {
+        recordError("restore", error);
+        unconfirmed = true;
+        // Never use a fresh SyncToken to overwrite a concurrent edit.
+        try { observed = await reread(row.type, original.id); } catch { /* Keep the last known figures. */ }
       }
-      if (!original(observed)) rollbackError = "QuickBooks did not confirm the original receipt values.";
-    } catch (error) {
-      rollbackError = explainFailure(error);
+      if (unconfirmed) break;
+    }
+    if (roundingDifference && !compensated) {
+      compensated = true;
+      steps.splice(i + 1, 0, { ...step, tax: Math.round((tax + roundingDifference) * 100) / 100 });
     }
   }
 
+  if (tried.length) {
+    console.warn("settlement.quickbooks.unverified", { type: row.type, attempts: tried.length, unconfirmed });
+  }
+  const reason = lastIssue || "No compatible update is enabled.";
   return {
-    before, after: view(observed), verified: false, applied: saved || !!rollbackError, failed: true, link, tried,
-    reason: rollbackError || tried.join(" · ") || "No compatible tax update is enabled.",
-    message: rollbackError
-      ? "Check this receipt in QuickBooks. The other receipts can continue."
-      : "QuickBooks did not save the exact settlement amounts.",
-    taxToEnter: tax,
+    before, after: view(observed), verified: false, applied: changed || unconfirmed, failed: true, link, tried,
+    reason,
+    message: unconfirmed ? "QuickBooks did not confirm the original receipt. Check its current values."
+      : `QuickBooks could not verify the correction. ${reason}`,
+    taxToEnter: adjustment ? undefined : tax,
   };
 });
