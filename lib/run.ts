@@ -24,6 +24,7 @@ export function parseRow(body: any): Row {
   const docNumber = typeof r.docNumber === "string" && r.docNumber.length <= 100 && r.docNumber.match(/\d+$/)?.[0] === order ? r.docNumber : undefined;
   return {
     order, type: r.type, amount: Number(r.amount), fileTax, docNumber,
+    legacyRefundZeroTax: r.type === "refund" && r.legacyRefundZeroTax === true,
     fileFreight: Number(r.fileFreight || 0), txnId: String(r.txnId || ""),
     customer: String(r.customer || ""), date: String(r.date || ""), depositNo: String(r.depositNo || ""), receivedFrom: String(r.receivedFrom || ""),
     prefix: typeof r.prefix === "string" && /^[A-Za-z0-9#\-_. ]{0,30}$/.test(r.prefix) ? r.prefix : undefined,
