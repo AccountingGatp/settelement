@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import ExcelJS from "exceljs";
-import { reconcile, scenarioOf } from "../lib/recon";
+import * as XLSX from "xlsx";
+import { reconcile, scenarioOf, verified } from "../lib/recon";
 import { explainFailure, detectPrefix, retargetTax } from "../lib/qb";
 import type { QDoc, QLine } from "../lib/qb";
 import type { Row } from "../lib/settlement";
@@ -13,7 +14,7 @@ const row = (order: string, amount: number, fileTax: number, type: "sale" | "ref
 const line = (name: string, amount: number, taxCode = "TAX"): QLine => ({ kind: "item", itemId: name === "Shipping" ? "9" : "1", name, qty: 1, rate: amount, amount, taxCode });
 function doc(order: string, lines: QLine[], tax: number, kind: "sale" | "refund" = "sale"): QDoc {
   const total = Math.round((lines.reduce((t, l) => t + l.amount, 0) + tax) * 100) / 100;
-  return { kind, id: "q" + order, syncToken: "0", docNumber: "Woo Order#" + order, total, tax, lines, inDeposit: false, customer: "Some One", raw: {} };
+  return { kind, id: "q" + order, syncToken: "0", docNumber: (kind === "refund" ? "Woo Refund#" : "Woo Order#") + order, total, tax, lines, inDeposit: false, customer: "Some One", raw: {} };
 }
 
 assert.equal(scenarioOf(11.88, 11.88), "C");
@@ -52,14 +53,54 @@ assert.equal(scenarioOf(5, 0), "D");
 
 // not only tax (a line is missing): review, nothing planned
 { const q = doc("6", [line("Product", 100)], 8); const v = reconcile(row("6", 120, 8), q);
-  assert.equal(v.status, "Pending review"); assert.equal(v.plan.tax, undefined); assert.ok(v.blockers[0].includes("not tax")); }
+  assert.equal(v.status, "Pending review"); assert.equal(v.plan.tax, undefined); assert.ok(v.blockers[0].includes("amount before tax")); }
 // tax equal but total differs: review
 { const q = doc("7", [line("Product", 100)], 8); const v = reconcile(row("7", 113.99, 8), q); assert.equal(v.status, "Pending review"); }
 
-// refunds are never changed automatically
-{ const q = doc("8", [line("Product", 50)], 4, "refund"); const v = reconcile(row("8", -50, 0, "refund"), q);
-  assert.equal(v.status, "Pending review"); assert.equal(v.plan.tax, undefined); }
-{ const q = doc("9", [line("Product", 50)], 4, "refund"); assert.equal(reconcile(row("9", -54, 4, "refund"), q).status, "Matched"); }
+// A one-cent tax-only difference in either direction requires a fix and cannot pass verification.
+for (const tax of [3.99, 4.01]) {
+  const v = reconcile(row("8", 54, 4), doc("8", [line("Product", 50)], tax));
+  assert.equal(v.status, "Needs fix");
+  assert.equal(Math.abs(v.taxDiff!), 0.01);
+  assert.equal(verified(v), false);
+}
+assert.equal(scenarioOf(0, 0.01), "A");
+assert.equal(scenarioOf(0.01, 0), "D");
+assert.equal(reconcile(row("8", 54, 4), doc("8", [line("Product", 49.99)], 4)).status, "Pending review");
+
+// Refunds use the same exact tax-only test when the file specifies refunded tax.
+const refund = row("9", -54, 4, "refund");
+const refundDoc = doc("9", [line("Product", 50)], 4.01, "refund");
+assert.equal(reconcile(refund, refundDoc).status, "Needs fix");
+assert.equal(reconcile({ ...refund, fileTax: null }, refundDoc).status, "Pending review");
+assert.equal(reconcile({ ...refund, amount: -53 }, refundDoc).status, "Pending review");
+assert.equal(reconcile({ ...refund, reviewReason: "Ambiguous refund" }, refundDoc).status, "Pending review");
+assert.equal(reconcile({ ...refund, amount: -50, fileTax: 0 }, refundDoc).plan.tax?.mode, "remove");
+assert.equal(verified(reconcile(refund, doc("9", [line("Product", 50)], 4, "refund"))), true);
+
+const workbookSource = XLSX.utils.book_new();
+XLSX.utils.book_append_sheet(workbookSource, XLSX.utils.aoa_to_sheet([
+  ["Linked Transaction Number", "Linked Transaction Type", "File Amount", "Order Total Tax Amount", "Refund Tax Amount"],
+  ["Woo Refund#100", "RefundReceipt", -54, 8, 4],
+  ["Woo Refund#101", "RefundReceipt", -22, 8, ""],
+  ["Woo Order#102", "SalesReceipt", 54, 4, ""],
+  ["Woo Refund#102", "RefundReceipt", -54, 8, ""],
+]), "main");
+const workbookRows = parseSettlement(XLSX.write(workbookSource, { bookType: "xlsx", type: "array" })).rows;
+assert.deepEqual(workbookRows.map((r) => r.fileTax), [4, null, 4, 4]);
+assert.equal(workbookRows[0].docNumber, "Woo Refund#100");
+
+const csv = [
+  "Transaction ID,Transaction Status,Transaction Type,Settlement Amount,Invoice Number,L2 - Tax",
+  "500,Credited,Refund,-54,100,4",
+  "501,Settled Successfully,Refund,-54,100,4",
+  "502,Credited,Refund,-22,101,",
+  "503,Credited,Refund,-10,102,0",
+].join("\n");
+const rawRows = parseSettlement(Uint8Array.from(Buffer.from(csv)).buffer).rows;
+assert.deepEqual(rawRows.map((r) => r.fileTax), [4, 4, null, 0]);
+assert.equal(rawRows[1].type, "refund");
+assert.ok(rawRows[0].reviewReason && rawRows[1].reviewReason);
 
 // prefix detection
 assert.equal(detectPrefix(["Order#73102", "Order#73103", "X9"], new Set(["73102", "73103"])), "Order#");
@@ -84,21 +125,27 @@ assert.match(explainFailure(null, { taxStillWrong: true }), /did not take/);
   const after = reconcile(row("73095", 49.04, 4.05), doc("73095", [line("Product", 36.15), line("Shipping", 8.84, "NON")], 4.05));
   const nf = reconcile(row("999", 10, 1), null);
   for (const v of [before, nf]) v.date = "09/08/2026";
-  const { buffer, filename } = await buildOutput([{ ...before, after, final: "Corrected, verified" }, nf]);
+  after.date = before.date;
+  const { buffer, filename } = await buildOutput([{ ...after, before, final: "Corrected, verified" }, nf]);
   assert.equal(filename, "AuthorizeNet_08_Sep_output.xlsx");
   const wb = new ExcelJS.Workbook(); await wb.xlsx.load(buffer as any);
   assert.deepEqual(wb.worksheets.map((w) => w.name), ["main", "Sales_Authnet", "Changes"]);
   const m = wb.getWorksheet("main")!, o = wb.getWorksheet("Sales_Authnet")!;
   assert.equal(m.getRow(1).getCell(12).value, "Order Total Tax Amount");
   assert.equal(m.getRow(2).getCell(6).value, 49.04); assert.equal(m.getRow(2).getCell(13).value, 4.05); // fixed values
+  assert.equal(m.getRow(2).getCell(14).formula, "ROUND(L2-M2,2)");
+  assert.equal(XLSX.read(buffer, { type: "buffer" }).Sheets.main.N2.v, 0);
   assert.equal(o.getRow(2).getCell(13).value, 5.04);                                                       // old values kept on the other sheet
   assert.equal(m.getRow(3).getCell(6).value, ""); assert.equal(m.getRow(3).getCell(12).value, 1);          // not found: QBO blank, file tax kept
+  const zeroTaxRefund = reconcile({ ...refund, amount: -50, fileTax: 0 }, doc("9", [line("Product", 50)], 0, "refund"));
+  const zeroRefundOutput = (await buildOutput([zeroTaxRefund])).buffer;
+  assert.equal(parseSettlement(Uint8Array.from(zeroRefundOutput).buffer).rows[0].fileTax, 0);
   console.log("logic + output workbook tests passed");
 
   const f = process.env.OUT_0908;
   if (f && fs.existsSync(f)) {
     const s = parseSettlement(fs.readFileSync(f).buffer.slice(0) as ArrayBuffer);
-    assert.ok(s.rows.length > 0); assert.ok(s.rows.some((r) => r.fileTax > 0));
+    assert.ok(s.rows.length > 0); assert.ok(s.rows.some((r) => (r.fileTax ?? 0) > 0));
     console.log(`parsed ${s.rows.length} rows from ${f}`);
   } else console.log("(skipped parser test: set OUT_0908)");
 })();

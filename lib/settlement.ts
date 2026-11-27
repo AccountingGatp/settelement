@@ -1,7 +1,7 @@
 // Reads the Authorize.net settlement download (xlsx/csv) and keeps only settled sales and credited refunds.
 import * as XLSX from "xlsx";
 
-export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; prefix?: string };
+export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number | null; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; docNumber?: string; prefix?: string; reviewReason?: string };
 export type Skipped = { txnId: string; order: string; status: string; amount: number; reason: string };
 export type Settlement = { rows: Row[]; skipped: Skipped[]; problems: string[]; counts: Record<string, number> };
 
@@ -10,6 +10,28 @@ const MON: Record<string, string> = { jan: "01", feb: "02", mar: "03", apr: "04"
 function settleDate(v: unknown): string {
   const m = String(v || "").match(/(\d{1,2})-([A-Za-z]{3})[a-z]*-(\d{4})/);
   return m ? `${MON[m[2].toLowerCase()] || "01"}/${m[1].padStart(2, "0")}/${m[3]}` : "";
+}
+
+const taxAmount = (value: unknown): number | null => {
+  const text = String(value ?? "").trim();
+  const cleaned = text.replace(/[$,()\s]/g, "");
+  return /^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(cleaned) && Number.isFinite(Number(cleaned))
+    ? Math.round(Math.abs(Number(cleaned)) * 100) / 100
+    : null;
+};
+
+function flagRepeatedOrders(rows: Row[]) {
+  const groups = new Map<string, Row[]>();
+  for (const row of rows) {
+    const key = `${row.type}:${row.order}`;
+    const group = groups.get(key) || [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    for (const row of group) row.reviewReason = "Multiple settlement rows share this order and receipt type. Confirm which QuickBooks receipt belongs to each transaction.";
+  }
 }
 
 const num = (v: unknown) => {
@@ -28,11 +50,18 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
     const t = String(d["Linked Transaction Type"] || "").toLowerCase();
     const type: "sale" | "refund" = /refund|credit/.test(t) || /refund/i.test(link) ? "refund" : "sale";
     const amount = num(d["File Amount"] !== "" && d["File Amount"] != null ? d["File Amount"] : d["Line Amount"]);
-    const k = `${type}:${order}:${amount}`;
+    const k = `${type}:${link}:${Math.abs(amount)}:${d["Deposit No"]}:${d["Date"]}`;
     if (seen.has(k)) { problems.push(`Order ${order} appears more than once with the same ${type} amount (${amount.toFixed(2)}). Check the file.`); continue; }
     seen.add(k);
-    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: num(d["Order Total Tax Amount"]), fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
+    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: type === "refund" ? taxAmount(d["Refund Tax Amount"]) : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
       date: String(d["Date"] || ""), depositNo: String(d["Deposit No"] || ""), receivedFrom: String(d["Received From"] || "") });
+  }
+  flagRepeatedOrders(rows);
+  const sales = new Map(rows.filter((row) => row.type === "sale" && !row.reviewReason).map((row) => [row.order, row]));
+  for (const row of rows) {
+    if (row.type !== "refund" || row.fileTax !== null || row.reviewReason) continue;
+    const sale = sales.get(row.order);
+    if (sale && sale.amount > 0 && sale.amount === Math.abs(row.amount)) row.fileTax = sale.fileTax;
   }
   return { rows, skipped: [], problems, counts: { "Rows in the output workbook": rows.length } };
 }
@@ -54,7 +83,7 @@ export function parseSettlement(buf: ArrayBuffer): Settlement {
   if (missing.length) return { rows: [], skipped: [], problems: [`This does not look like an Authorize.net settlement download or the output workbook. Missing columns: ${missing.join(", ")}.`], counts: {} };
 
   const rows: Row[] = [], skipped: Skipped[] = [], counts: Record<string, number> = {};
-  const seen = new Map<string, number>();
+  const seen = new Set<string>();
   for (const d of data) {
     const txnId = String(d["Transaction ID"] || "").trim();
     if (!txnId) continue;
@@ -62,16 +91,17 @@ export function parseSettlement(buf: ArrayBuffer): Settlement {
     counts[status] = (counts[status] || 0) + 1;
     const order = String(d["Invoice Number"] || "").trim();
     const amount = num(d["Settlement Amount"]);
-    const sale = status === "Settled Successfully";
-    const refund = status === "Credited";
+    const settled = /^settled successfully$/i.test(status);
+    const refund = /^credited$/i.test(status) || (settled && /refund|credit/i.test(String(d["Transaction Type"])));
+    const sale = settled && !refund;
     if (!sale && !refund) { skipped.push({ txnId, order, status, amount, reason: `${status || "No status"}: not settled` }); continue; }
     if (!/^\d+$/.test(order)) { skipped.push({ txnId, order, status, amount, reason: "No valid order number in Invoice Number" }); continue; }
     const type = refund ? "refund" : "sale";
-    const key = `${type}:${order}:${amount}`;
+    const key = txnId;
     if (seen.has(key)) { problems.push(`Order ${order} appears more than once with the same ${type} amount (${amount.toFixed(2)}). Check the file.`); continue; }
-    seen.set(key, 1);
+    seen.add(key);
     rows.push({
-      order, type, amount, txnId, fileTax: num(d["L2 - Tax"]), fileFreight: num(d["L2 - Freight"]),
+      order, type, amount, txnId, fileTax: refund ? taxAmount(d["L2 - Tax"]) : num(d["L2 - Tax"]), fileFreight: num(d["L2 - Freight"]),
       customer: [d["Customer First Name"], d["Customer Last Name"]].filter(Boolean).join(" "),
       ...(() => {
         const date = settleDate(d["Settlement Date/Time"]);
@@ -81,5 +111,6 @@ export function parseSettlement(buf: ArrayBuffer): Settlement {
       })(),
     });
   }
+  flagRepeatedOrders(rows);
   return { rows, skipped, problems, counts };
 }

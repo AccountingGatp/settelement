@@ -181,23 +181,30 @@ export function detectPrefix(numbers: string[], orders: Set<string>): string | n
   return best;
 }
 
-/** Which of these exact document numbers exist? One small query per 40 numbers, asking for the number only. */
+/** Which of these exact document numbers exist? Query up to 40 numbers at a time. */
 export async function existingDocNumbers(kind: Kind, docNumbers: string[]): Promise<Set<string>> {
   const found = new Set<string>();
   for (let i = 0; i < docNumbers.length; i += 40) {
     const list = docNumbers.slice(i, i + 40).map((d) => `'${esc(d)}'`).join(",");
-    const j = await api(`query?query=${encodeURIComponent(`select DocNumber from ${ENTITY[kind]} where DocNumber IN (${list}) maxresults 1000`)}`);
+    const j = await api(`query?query=${encodeURIComponent(`select * from ${ENTITY[kind]} where DocNumber IN (${list}) maxresults 1000`)}`);
     for (const r of j.QueryResponse?.[ENTITY[kind]] || []) found.add(String(r.DocNumber));
   }
   return found;
 }
 
-export async function findDoc(kind: Kind, order: string, prefix?: string): Promise<QDoc | null> {
-  const dn = docNumberFor(kind, order, prefix);
-  const rows = await queryAll(ENTITY[kind], `where DocNumber = '${esc(dn)}'`);
-  if (!rows.length) return null;
-  if (rows.length > 1) throw new Error(`More than one ${ENTITY[kind]} has the number “${dn}”. Check QuickBooks.`);
-  return view(kind, rows[0]);
+export async function findDoc(kind: Kind, order: string, prefix?: string, linkedNumber?: string): Promise<QDoc | null> {
+  const entity = ENTITY[kind];
+  const candidates = new Set([linkedNumber, docNumberFor(kind, order, prefix), docNumberFor(kind, order)]);
+  for (const number of candidates) {
+    if (!number) continue;
+    const rows = await queryAll(entity, `where DocNumber = '${esc(number)}'`);
+    if (rows.length > 1) throw new Error(`More than one ${entity} has the number “${number}”. Check QuickBooks.`);
+    if (rows.length === 1) return view(kind, rows[0]);
+  }
+  const matches = (await queryAll(entity, `where DocNumber like '%${esc(order)}'`))
+    .filter((receipt) => String(receipt.DocNumber || "").match(/\d+$/)?.[0] === order);
+  if (matches.length > 1) throw new Error(`More than one ${entity} ends in order ${order}. Confirm the linked transaction number.`);
+  return matches.length ? view(kind, matches[0]) : null;
 }
 
 /** Find any transaction whose number contains the text, in the connected company. Used to see what numbers the books really use. */
@@ -220,54 +227,48 @@ export async function reread(kind: Kind, id: string): Promise<QDoc> {
 }
 
 // ---------------------------------------------------------------- changes (approved tax fixes only)
-export type FixPlan = {
-  /** remove tax (all lines non-taxable), or set the total tax to a number */
-  tax?: { mode: "set"; total: number } | { mode: "remove" };
-  /** make the shipping line (by its QuickBooks item) non-taxable so QuickBooks recalculates a lower tax */
-  untaxItemId?: string;
-  /** how the tax amount is sent: "total" = only TotalTax (what Intuit documents for automated sales tax), "lines" = TotalTax and the first tax line */
-  style?: "total" | "lines";
-};
+export type FixStep = { kind: "remove" } | { kind: "shipping"; itemId: string } | { kind: "total" | "override"; tax: number };
 
-export async function applyFix(doc: QDoc, plan: FixPlan): Promise<void> {
+const receiptLines = (doc: QDoc) => (doc.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
+const taxCode = (line: any, code: string) => ({
+  ...line, SalesItemLineDetail: { ...line.SalesItemLineDetail, TaxCodeRef: { value: code } },
+});
+
+async function saveReceipt(doc: QDoc, fields: Record<string, unknown>): Promise<QDoc> {
   assertWritable();
-  const raw = doc.raw;
-  const body: any = { Id: doc.id, SyncToken: doc.syncToken, sparse: true };
-  let lines: any[] = (raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
-  const setCode = (pred: (l: any) => boolean, code: string) =>
-    (lines = lines.map((l) => (l.DetailType === "SalesItemLineDetail" && pred(l) ? { ...l, SalesItemLineDetail: { ...l.SalesItemLineDetail, TaxCodeRef: { value: code } } } : l)));
-
-  if (plan.untaxItemId) {
-    // only the first line with that item
-    const i = lines.findIndex((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.ItemRef?.value === plan.untaxItemId);
-    if (i >= 0) lines[i] = { ...lines[i], SalesItemLineDetail: { ...lines[i].SalesItemLineDetail, TaxCodeRef: { value: "NON" } } };
-  }
-  if (plan.tax?.mode === "remove") {
-    setCode(() => true, "NON");
-    body.TxnTaxDetail = { TotalTax: 0 };
-  } else if (plan.tax?.mode === "set") {
-    const anyTaxable = lines.some((l) => l.DetailType === "SalesItemLineDetail" && l.SalesItemLineDetail?.TaxCodeRef?.value && l.SalesItemLineDetail.TaxCodeRef.value !== "NON");
-    if (!anyTaxable) setCode(() => true, "TAX");
-    if (plan.style === "total") body.TxnTaxDetail = { TotalTax: plan.tax.total };
-    else {
-      const td = JSON.parse(JSON.stringify(raw.TxnTaxDetail || {}));
-      const gap = round2(plan.tax.total - Number(td.TotalTax || 0));
-      if (Array.isArray(td.TaxLine) && td.TaxLine.length) td.TaxLine[0].Amount = round2(Number(td.TaxLine[0].Amount || 0) + gap); // the whole change goes on the first tax line
-      td.TotalTax = plan.tax.total;
-      body.TxnTaxDetail = td;
-    }
-  }
-  body.Line = lines;
-  await api(PATH[doc.kind], body);
+  const result = await api(PATH[doc.kind], { Id: doc.id, SyncToken: doc.syncToken, sparse: true, ...fields });
+  return view(doc.kind, result[ENTITY[doc.kind]]);
 }
 
-/** Save the receipt's own lines again, unchanged, so QuickBooks recalculates the tax. A tax override stored through the API only shows
- *  in the totals after a second save (seen on a real receipt: it read 7.22 right after the override, then 6.56 after the next save). */
-export async function recalc(kind: Kind, id: string): Promise<void> {
-  assertWritable();
-  const cur = await reread(kind, id);
-  const lines = (cur.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
-  await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines });
+export function applyTaxStep(doc: QDoc, step: FixStep): Promise<QDoc> {
+  if (step.kind === "total") {
+    const code = doc.raw.TxnTaxDetail?.TxnTaxCodeRef;
+    return saveReceipt(doc, { TxnTaxDetail: { ...(code ? { TxnTaxCodeRef: code } : {}), TotalTax: step.tax } });
+  }
+  const lines = receiptLines(doc);
+  if (step.kind === "override") {
+    return saveReceipt(doc, { Line: lines, TxnTaxDetail: retargetTax(doc.raw.TxnTaxDetail, step.tax) });
+  }
+  if (step.kind === "remove") {
+    return saveReceipt(doc, {
+      Line: lines.map((line: any) => line.DetailType === "SalesItemLineDetail" ? taxCode(line, "NON") : line),
+      TxnTaxDetail: { TotalTax: 0 },
+    });
+  }
+  if (step.kind === "shipping") {
+    const index = lines.findIndex((line: any) => line.SalesItemLineDetail?.ItemRef?.value === step.itemId);
+    if (index < 0) throw new Error("The shipping item is no longer on the receipt.");
+    lines[index] = taxCode(lines[index], "NON");
+  }
+  return saveReceipt(doc, { Line: lines });
+}
+
+export function recalc(doc: QDoc): Promise<QDoc> {
+  return saveReceipt(doc, { Line: receiptLines(doc) });
+}
+
+export function restore(doc: QDoc, original: QDoc): Promise<QDoc> {
+  return saveReceipt(doc, { Line: receiptLines(original), TxnTaxDetail: original.raw.TxnTaxDetail || { TotalTax: 0 } });
 }
 
 /** Spread a new total tax over the receipt's tax lines (in proportion to what each holds) and record the difference on each line as the
@@ -277,45 +278,19 @@ export function retargetTax(td: any, target: number): any {
   const lines: any[] = Array.isArray(t.TaxLine) ? t.TaxLine : [];
   if (!lines.length) throw new Error("This receipt has no tax line to override. Enter the tax by hand.");
   const sum = lines.reduce((a, l) => a + Number(l.Amount || 0), 0);
-  let left = target;
+  let allocated = 0;
+  let weight = 0;
   lines.forEach((l, i) => {
     const old = Number(l.Amount || 0);
-    const n = i === lines.length - 1 ? left : round2(sum > 0 ? (old / sum) * target : target / lines.length);
-    left = round2(left - n);
+    weight += sum > 0 ? old / sum : 1 / lines.length;
+    const cumulative = i === lines.length - 1 ? target : round2(weight * target);
+    const n = round2(cumulative - allocated);
+    allocated = cumulative;
     l.Amount = n;
     l.TaxLineDetail = { ...(l.TaxLineDetail || {}), OverrideDeltaAmount: round2(Number(l.TaxLineDetail?.OverrideDeltaAmount || 0) + (n - old)) };
   });
   t.TotalTax = target;
   return t;
-}
-
-/** Set the total tax of a receipt to an exact amount through the API, then check it by re-reading. A tax override only shows in the
- *  totals after a second save, so each round is: write, save again, read. Up to 3 rounds, each correcting what QuickBooks reports. */
-export async function overrideTax(kind: Kind, id: string, target: number): Promise<QDoc> {
-  assertWritable();
-  let cur = await reread(kind, id);
-  for (let round = 0; round < 3 && Math.abs(cur.tax - target) > 0.005; round++) {
-    const lines = (cur.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
-    await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines, TxnTaxDetail: retargetTax(cur.raw.TxnTaxDetail, target) });
-    await recalc(kind, id);
-    cur = await reread(kind, id);
-  }
-  return cur;
-}
-
-// ---------------------------------------------------------------- rollback and failure reasons
-/** Put a receipt back to what it was before a fix: its original lines, then its original total tax (worked out the same way as an override,
- *  so a tax that was overridden before stays as it was). Returns the receipt as re-read. */
-export async function restore(kind: Kind, id: string, original: any): Promise<QDoc> {
-  assertWritable();
-  const cur = await reread(kind, id);
-  const lines = (original.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
-  await api(PATH[kind], { Id: id, SyncToken: cur.syncToken, sparse: true, Line: lines });
-  await recalc(kind, id);
-  const back = await reread(kind, id);
-  const wasTax = round2(Number(original.TxnTaxDetail?.TotalTax || 0));
-  if (Math.abs(back.tax - wasTax) <= 0.005) return back;
-  try { return await overrideTax(kind, id, wasTax); } catch { return back; }
 }
 
 /** A short, plain reason for a failed fix, from QuickBooks's message. */
