@@ -85,10 +85,21 @@ XLSX.utils.book_append_sheet(workbookSource, XLSX.utils.aoa_to_sheet([
   ["Woo Refund#101", "RefundReceipt", -22, 8, ""],
   ["Woo Order#102", "SalesReceipt", 54, 4, ""],
   ["Woo Refund#102", "RefundReceipt", -54, 8, ""],
+  ["Woo Refund#103", "RefundReceipt", -45.45, -2.77, ""],
 ]), "main");
 const workbookRows = parseSettlement(XLSX.write(workbookSource, { bookType: "xlsx", type: "array" })).rows;
-assert.deepEqual(workbookRows.map((r) => r.fileTax), [4, null, 4, 4]);
+assert.deepEqual(workbookRows.map((r) => r.fileTax), [4, null, 4, 4, 2.77]);
 assert.equal(workbookRows[0].docNumber, "Woo Refund#100");
+const legacyRefund = workbookRows[4];
+const bookedRefund = doc("103", [line("Product", 40.99)], 2.77, "refund");
+assert.equal(reconcile(legacyRefund, bookedRefund).status, "Pending review");
+const enabledRefund = reconcile(legacyRefund, bookedRefund, { id: "500", name: "Refund adjustment" });
+assert.equal(enabledRefund.status, "Needs fix");
+assert.equal(enabledRefund.taxDiff, 0);
+assert.equal(enabledRefund.totalDiff, 1.69);
+assert.deepEqual(enabledRefund.plan.adjustment, { id: "500", name: "Refund adjustment", amount: 1.69 });
+assert.equal(enabledRefund.plan.tax, undefined);
+
 
 const csv = [
   "Transaction ID,Transaction Status,Transaction Type,Settlement Amount,Invoice Number,L2 - Tax",

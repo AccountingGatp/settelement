@@ -46,6 +46,8 @@ function addSheet(wb: ExcelJS.Workbook, name: string, rows: OutRow[], when: "bef
 
 function changeText(v: OutRow): string {
   const p = v.plan;
+  if (p.adjustment) return `Refund adjustment ${p.adjustment.amount.toFixed(2)} to ${p.adjustment.name}` +
+    (p.tax ? ` and set tax to ${p.preview?.taxTo.toFixed(2)}` : "");
   if (!p.tax) return "";
   const pv = p.preview ? ` | tax ${p.preview.taxFrom.toFixed(2)} → ${p.preview.taxTo.toFixed(2)}, total ${p.preview.totalFrom.toFixed(2)} → ${p.preview.totalTo.toFixed(2)}` : "";
   if (p.tax.mode === "remove") return "Remove tax (all lines non-taxable)" + pv;
