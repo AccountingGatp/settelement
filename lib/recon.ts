@@ -59,6 +59,11 @@ export function reconcile(row: Row, q: QDoc | null, refundItem?: RefundItem): Ve
   v.totalDiff = difference(v.settle, q.total);
   if (q.inDeposit) v.notes.push("In deposit");
 
+  // A zero from the legacy workbook can confirm a match. It cannot authorize a write.
+  if (row.type === "refund" && v.fileTax === null && row.legacyRefundZeroTax &&
+      !row.reviewReason && v.totalDiff === 0 && sameMoney(q.tax, 0)) {
+    v.fileTax = 0;
+  }
   if (v.fileTax === null) {
     v.blockers.push("The file does not identify the refunded tax. Use a settlement export with refund tax or supply Refund Tax Amount in the workbook.");
     return v;

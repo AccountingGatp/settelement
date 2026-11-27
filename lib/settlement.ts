@@ -1,7 +1,7 @@
 // Reads the Authorize.net settlement download (xlsx/csv) and keeps only settled sales and credited refunds.
 import * as XLSX from "xlsx";
 
-export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number | null; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; docNumber?: string; prefix?: string; reviewReason?: string };
+export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number | null; legacyRefundZeroTax?: boolean; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; docNumber?: string; prefix?: string; reviewReason?: string };
 export type Skipped = { txnId: string; order: string; status: string; amount: number; reason: string };
 export type Settlement = { rows: Row[]; skipped: Skipped[]; problems: string[]; counts: Record<string, number> };
 
@@ -57,7 +57,9 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
     // The signed tax on the team's refund rows is a refund figure. An unsigned legacy value may be the original sale's tax.
     const refundTax = taxAmount(d["Refund Tax Amount"]) ??
       (/^\s*(?:-|\(|\$-)/.test(String(legacyRefundTax ?? "")) ? taxAmount(legacyRefundTax) : null);
-    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: type === "refund" ? refundTax : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
+    const legacyRefundZeroTax = type === "refund" && refundTax === null &&
+      (legacyRefundTax === 0 || /^\s*0(?:\.0+)?\s*$/.test(String(legacyRefundTax ?? "")));
+    rows.push({ order, type, legacyRefundZeroTax, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: type === "refund" ? refundTax : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
       date: String(d["Date"] || ""), depositNo: String(d["Deposit No"] || ""), receivedFrom: String(d["Received From"] || "") });
   }
   flagRepeatedOrders(rows);
@@ -72,7 +74,22 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
 
 export function parseSettlement(buf: ArrayBuffer): Settlement {
   const wb = XLSX.read(buf, { type: "array" });
-  const sheetRows = (name: string) => XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[name], { defval: "", raw: false });
+  const sheetRows = (name: string) => {
+    const sheet = wb.Sheets[name];
+    const rows = XLSX.utils.sheet_to_json<Record<string, unknown> & { __rowNum__: number }>(sheet, { defval: "", raw: false });
+    if (!sheet["!ref"] || !rows.length) return rows;
+    const { s, e } = XLSX.utils.decode_range(sheet["!ref"]);
+    // Accounting formats can display a stored zero as a dash. Preserve numeric tax cells.
+    for (let c = s.c; c <= e.c; c++) {
+      const header = sheet[XLSX.utils.encode_cell({ r: s.r, c })]?.v;
+      if (header !== "Order Total Tax Amount" && header !== "Refund Tax Amount" && header !== "L2 - Tax") continue;
+      for (const row of rows) {
+        const cell = sheet[XLSX.utils.encode_cell({ r: row.__rowNum__, c })];
+        if (cell?.t === "n") row[header] = cell.v;
+      }
+    }
+    return rows;
+  };
   // output workbook: use its "main" sheet (or the first sheet that has the columns)
   for (const name of ["main", ...wb.SheetNames]) {
     if (!wb.Sheets[name]) continue;

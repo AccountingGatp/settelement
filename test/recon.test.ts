@@ -79,16 +79,20 @@ assert.equal(reconcile({ ...refund, amount: -50, fileTax: 0 }, refundDoc).plan.t
 assert.equal(verified(reconcile(refund, doc("9", [line("Product", 50)], 4, "refund"))), true);
 
 const workbookSource = XLSX.utils.book_new();
-XLSX.utils.book_append_sheet(workbookSource, XLSX.utils.aoa_to_sheet([
+const sourceSheet = XLSX.utils.aoa_to_sheet([
   ["Linked Transaction Number", "Linked Transaction Type", "File Amount", "Order Total Tax Amount", "Refund Tax Amount"],
   ["Woo Refund#100", "RefundReceipt", -54, 8, 4],
   ["Woo Refund#101", "RefundReceipt", -22, 8, ""],
   ["Woo Order#102", "SalesReceipt", 54, 4, ""],
   ["Woo Refund#102", "RefundReceipt", -54, 8, ""],
   ["Woo Refund#103", "RefundReceipt", -45.45, -2.77, ""],
-]), "main");
+  ["Woo Refund#104", "RefundReceipt", -57.67, 0, ""],
+  ["Woo Refund#105", "RefundReceipt", -57.67, "-", ""],
+]);
+sourceSheet.D7.z = '0.00;-0.00;"-"';
+XLSX.utils.book_append_sheet(workbookSource, sourceSheet, "main");
 const workbookRows = parseSettlement(XLSX.write(workbookSource, { bookType: "xlsx", type: "array" })).rows;
-assert.deepEqual(workbookRows.map((r) => r.fileTax), [4, null, 4, 4, 2.77]);
+assert.deepEqual(workbookRows.map((r) => r.fileTax), [4, null, 4, 4, 2.77, null, null]);
 assert.equal(workbookRows[0].docNumber, "Woo Refund#100");
 const legacyRefund = workbookRows[4];
 const bookedRefund = doc("103", [line("Product", 40.99)], 2.77, "refund");
@@ -99,6 +103,16 @@ assert.equal(enabledRefund.taxDiff, 0);
 assert.equal(enabledRefund.totalDiff, 1.69);
 assert.deepEqual(enabledRefund.plan.adjustment, { id: "500", name: "Refund adjustment", amount: 1.69 });
 assert.equal(enabledRefund.plan.tax, undefined);
+
+const dashFormattedZero = workbookRows[5];
+const zeroTaxReceipt = doc("104", [line("Product", 57.67)], 0, "refund");
+assert.equal(dashFormattedZero.legacyRefundZeroTax, true);
+assert.equal(verified(reconcile(dashFormattedZero, zeroTaxReceipt)), true);
+assert.equal(reconcile(dashFormattedZero, zeroTaxReceipt).taxDiff, 0);
+assert.deepEqual(reconcile(dashFormattedZero, zeroTaxReceipt).plan, {});
+assert.equal(reconcile({ ...dashFormattedZero, amount: -58 }, zeroTaxReceipt).status, "Pending review");
+assert.equal(reconcile(dashFormattedZero, doc("104", [line("Product", 56.67)], 1, "refund")).status, "Pending review");
+assert.equal(reconcile(workbookRows[6], zeroTaxReceipt).status, "Pending review");
 
 
 const csv = [
