@@ -28,20 +28,20 @@ assert.equal(scenarioOf(5, 0), "D");
 // not found: nothing planned, row kept
 { const v = reconcile(row("2", 50, 3), null); assert.equal(v.status, "Not found"); assert.equal(v.fileTax, 3); assert.equal(v.qboTotal, 0); assert.ok(v.blockers[0]); }
 
-// B: QBO tax higher because shipping is taxed (video example: 0.99 on shipping) -> untax shipping
+// B: A shipping line is present. Adjust the total tax directly.
 { const q = doc("73095", [line("Product", 36.15), line("Shipping", 8.84)], 5.04); // shipping tax = 0.99
   const v = reconcile(row("73095", 49.04, 4.05), q);
   assert.equal(v.status, "Needs fix"); assert.equal(v.scenario, "B"); assert.equal(v.taxDiff, -0.99);
-  assert.deepEqual(v.plan.tax, { mode: "set", total: 4.05 }); assert.equal(v.plan.untaxShipping?.name, "Shipping"); }
+  assert.deepEqual(v.plan.tax, { mode: "set", total: 4.05 }); }
 
 // B: real 85153 shape: discount line, shipping is QuickBooks's shipping field with no tax code, surplus tax 0.91 = tax on shipping
 { const q: QDoc = { kind: "sale", id: "q85153", syncToken: "0", docNumber: "Woo Order#85153", total: 108.47, tax: 7.24, inDeposit: false, customer: "X", raw: {}, lines: [line("Gas Money", 47.49), line("Orange", 47.49), { kind: "discount", itemId: "", name: "Discount", qty: 0, rate: 0, amount: 4.74, taxCode: "" }, { kind: "item", itemId: "SHIPPING_ITEM_ID", name: "Shipping", qty: 1, rate: 10.99, amount: 10.99, taxCode: "" }] };
   const v = reconcile(row("85153", 107.56, 6.33), q);
-  assert.equal(v.status, "Needs fix"); assert.equal(v.plan.untaxShipping?.itemId, "SHIPPING_ITEM_ID"); }
+  assert.equal(v.status, "Needs fix"); assert.deepEqual(v.plan.tax, { mode: "set", total: 6.33 }); }
 
 // B: QBO tax higher but shipping does not explain it -> plain set (override)
 { const q = doc("3", [line("Product", 60)], 5.94); const v = reconcile(row("3", 65.01, 5.01), q);
-  assert.equal(v.status, "Needs fix"); assert.equal(v.plan.untaxShipping, undefined); assert.deepEqual(v.plan.tax, { mode: "set", total: 5.01 }); }
+  assert.equal(v.status, "Needs fix"); assert.deepEqual(v.plan.tax, { mode: "set", total: 5.01 }); }
 
 // A: file has no tax, QBO taxed -> remove
 { const q = doc("4", [line("Product", 160.49)], 8.62); const v = reconcile(row("4", 160.49, 0), q);
@@ -113,6 +113,19 @@ assert.deepEqual(reconcile(dashFormattedZero, zeroTaxReceipt).plan, {});
 assert.equal(reconcile({ ...dashFormattedZero, amount: -58 }, zeroTaxReceipt).status, "Pending review");
 assert.equal(reconcile(dashFormattedZero, doc("104", [line("Product", 56.67)], 1, "refund")).status, "Pending review");
 assert.equal(reconcile(workbookRows[6], zeroTaxReceipt).status, "Pending review");
+
+const lineSource = XLSX.utils.book_new();
+XLSX.utils.book_append_sheet(lineSource, XLSX.utils.aoa_to_sheet([
+  ["Linked Transaction Number", "Line Amount", "File Amount", "Order Total Tax Amount"],
+  ["Woo Order#200", 61.25, 60, 5],
+  ["Woo Order#201", 60, "", 5],
+]), "main");
+const [lineMismatch, missingTarget] = parseSettlement(XLSX.write(lineSource, { bookType: "xlsx", type: "array" })).rows;
+const live = doc("200", [line("Product", 55)], 5);
+assert.equal(lineMismatch.amount, 60);
+assert.equal(reconcile(lineMismatch, live).totalDiff, 0);
+assert.equal(reconcile(lineMismatch, live).lineDiff, 1.25);
+assert.equal(reconcile(missingTarget, live).status, "Pending review");
 
 
 const csv = [

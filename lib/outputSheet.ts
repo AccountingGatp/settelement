@@ -50,8 +50,7 @@ function changeText(v: OutRow): string {
     (p.tax ? ` and set tax to ${p.preview?.taxTo.toFixed(2)}` : "");
   if (!p.tax) return "";
   const pv = p.preview ? ` | tax ${p.preview.taxFrom.toFixed(2)} → ${p.preview.taxTo.toFixed(2)}, total ${p.preview.totalFrom.toFixed(2)} → ${p.preview.totalTo.toFixed(2)}` : "";
-  if (p.tax.mode === "remove") return "Remove tax (all lines non-taxable)" + pv;
-  return (p.untaxShipping ? `Make ${p.untaxShipping.name} non-taxable` : `Override total tax to ${p.tax.total.toFixed(2)}`) + pv;
+  return `Override total tax to ${p.tax.mode === "remove" ? "0.00" : p.tax.total.toFixed(2)}` + pv;
 }
 
 export async function buildOutput(rows: OutRow[], account = process.env.DEPOSIT_ACCOUNT || "First Citizen Clearing Account"): Promise<{ buffer: Buffer; filename: string }> {
@@ -61,15 +60,18 @@ export async function buildOutput(rows: OutRow[], account = process.env.DEPOSIT_
   addSheet(wb, "Sales_Authnet", rows, "before", account);
 
   const ws = wb.addWorksheet("Changes", { views: [{ state: "frozen", ySplit: 1 }] });
-  ws.addRow(["Order", "Type", "Difference type", "Result", "Tax scenario", "In deposit", "Changed or planned", "Reason / needs review because"]).font = { bold: true };
-  [10, 10, 22, 22, 12, 11, 70, 70].forEach((w, i) => (ws.getColumn(i + 1).width = w));
+  ws.addRow(["Order", "Type", "Difference type", "Result", "Tax scenario", "In deposit", "Changed or planned", "Reason / needs review because", "Uploaded Line Amount", "Line Difference", "QuickBooks Receipt ID", "QuickBooks Read At (UTC)"]).font = { bold: true };
+  [10, 10, 22, 22, 12, 11, 70, 70, 20, 18, 23, 28].forEach((w, i) => (ws.getColumn(i + 1).width = w));
   for (const v of rows) {
     const initial = v.before || v;
     const t = initial.issues.some((i) => i.field === "Tax"), o = initial.issues.some((i) => i.field !== "Tax");
-    const kind = initial.status === "Matched" ? "Matched" : v.status === "Not found" ? "Not found" : o ? "Amount differs (not tax)" : t ? "Tax" : "Review";
-    ws.addRow([v.order, v.type === "sale" ? "Sale" : "Refund", kind, v.final || v.status, initial.scenario, v.inDeposit ? "Yes" : "",
+    const kind = v.status === "Line amount differs" ? "Uploaded Line Amount" : initial.status === "Matched" ? "Matched" : v.status === "Not found" ? "Not found" : o ? "Amount differs (not tax)" : t ? "Tax" : "Review";
+    const reportRow = ws.addRow([v.order, v.type === "sale" ? "Sale" : "Refund", kind, v.final || v.status, initial.scenario, v.inDeposit ? "Yes" : "",
       v.final === "Skipped" ? "Skipped by the user. Nothing was changed in QuickBooks." : v.final === "Tax to enter by hand" ? `Enter tax ${(v.taxToEnter ?? 0).toFixed(2)} by hand in QuickBooks (Edit sales tax, Apply override).` : changeText(initial),
-      [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | ")]);
+      [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | "),
+      v.lineAmount ?? "", v.lineDiff ?? "", v.receiptId ?? "", v.checkedAt ?? ""]);
+    reportRow.getCell(9).numFmt = "#,##0.00";
+    reportRow.getCell(10).numFmt = "#,##0.00";
   }
 
   const d = (rows.find((r) => r.date)?.date || "").split("/");
