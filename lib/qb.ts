@@ -228,8 +228,12 @@ export async function searchDocs(text: string): Promise<Found[]> {
 
 /** Re-read straight from QuickBooks (used to verify after a save). */
 export async function reread(kind: Kind, id: string): Promise<QDoc> {
-  const j = await api(`${PATH[kind]}/${id}`);
-  return view(kind, j[ENTITY[kind]]);
+  const j = await api(`${PATH[kind]}/${encodeURIComponent(id)}`);
+  const saved = j[ENTITY[kind]];
+  if (!saved || String(saved.Id) !== String(id) || saved.TotalAmt == null || !Number.isFinite(Number(saved.TotalAmt))) {
+    throw new Error("QuickBooks did not return the requested receipt and its total.");
+  }
+  return view(kind, saved);
 }
 
 // ---------------------------------------------------------------- receipt corrections
@@ -244,12 +248,9 @@ export async function findRefundAdjustmentItem(): Promise<{ id: string; name: st
   return { id: String(item.Id), name: String(item.Name) };
 }
 
-export type FixStep = { kind: "total" | "lines" | "override" | "shipping" | "remove"; tax: number; shippingId?: string };
+export type FixStep = { kind: "total" | "lines" | "override"; tax: number };
 type Adjustment = { id: string; name: string; amount: number };
 const receiptLines = (doc: QDoc): any[] => (doc.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
-const taxCode = (line: any, code: string) => ({
-  ...line, SalesItemLineDetail: { ...line.SalesItemLineDetail, TaxCodeRef: { value: code } },
-});
 const totalTaxDetail = (doc: QDoc, tax: number) => {
   const code = doc.raw.TxnTaxDetail?.TxnTaxCodeRef;
   return { ...(code ? { TxnTaxCodeRef: code } : {}), TotalTax: tax };
@@ -273,13 +274,7 @@ export function applyTaxStep(doc: QDoc, baseline: QDoc, step: FixStep, adjustmen
   // The settlement tax is the full tax, including any shipping tax.
   const taxOverride = { ShippingTaxIncludedInTotalTax: true, TxnTaxDetail: td };
   if (step.kind === "total" && !adjustment && sameReceiptLines(doc, baseline)) return saveReceipt(doc, taxOverride);
-  const lines = receiptLines(baseline).map((line) => {
-    if (!line.SalesItemLineDetail) return line;
-    if (step.kind === "remove" || (step.kind === "shipping" && line.SalesItemLineDetail.ItemRef?.value === step.shippingId)) {
-      return taxCode(line, "NON");
-    }
-    return line;
-  });
+  const lines = receiptLines(baseline);
   if (adjustment) {
     // Rebuild from the starting receipt so every attempt targets the same total.
     // Reuse a line ID if a previous attempt already appended the adjustment.

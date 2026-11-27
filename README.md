@@ -6,10 +6,10 @@ There is no WooCommerce connection and no database; nothing is saved on any serv
 
 ## The rule (from the team's SOP video)
 - Column **L** of the output file (the file's tax, "Order Total Tax Amount") is the truth. QuickBooks tax (**M**) must equal it, so **TaxDiff = L − M = 0**.
-- File has no tax, QuickBooks has: tax is removed (Taxable unticked on every line).
-- QuickBooks tax is higher, usually because shipping was taxed: shipping is made non-taxable if that gives exactly the file's tax; otherwise the total tax is set to the file's tax.
+- When the settlement has zero tax, the direct override uses 0.00.
+- If tax differs, set QuickBooks total tax directly to the file’s tax, including when the receipt contains shipping.
 - QuickBooks tax is lower or missing: total tax is set to the file's tax.
-- The receipt total (**F**, "Line Amount") follows the new tax. Each fix is saved, re-read from QuickBooks and compared again; if it does not match, the receipt is put back.
+- The uploaded Line Amount (F) and File Amount (J) are compared separately with the live QuickBooks total. File Amount remains the target when both columns exist. A check or re-upload reads each receipt by ID. Verify and download Excel repeats that read for every row and puts the live figures on main. The Changes sheet records the uploaded line, its difference, and the receipt ID and read time. An attempted fix is verified by a separate receipt read and restored if verification fails and the receipt version still matches.
 - Sales differences before tax require review. A refund with a known tax amount can use the approved adjustment item to post a pre-tax difference.
 - Orders not found in QuickBooks are never created: they are listed in a popup, left as they are, and shown as "Not found" in the output.
 - Fix and Fix All include refunds when the source provides the refunded tax. Signed refund tax in the team workbook is recognized. For a pre-tax refund difference, set `QB_REFUND_ADJUSTMENT_ITEM` to the exact name of the approved active service or non-inventory item in QuickBooks. The tool posts the difference on that item as non-taxable and verifies the resulting refund. Use a populated refund transaction’s `L2 - Tax` in the expanded Authorize.net export or the `Refund Tax Amount` column in a workbook. Use an explicit zero for a tax-free refund. A workbook can also use the sale’s tax for a full refund when it contains one matching sale and one refund for the same order and amount.

@@ -1,7 +1,7 @@
 // Reads the Authorize.net settlement download (xlsx/csv) and keeps only settled sales and credited refunds.
 import * as XLSX from "xlsx";
 
-export type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number | null; legacyRefundZeroTax?: boolean; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; docNumber?: string; prefix?: string; reviewReason?: string };
+export type Row = { order: string; type: "sale" | "refund"; amount: number; lineAmount?: number; fileTax: number | null; legacyRefundZeroTax?: boolean; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string; docNumber?: string; prefix?: string; reviewReason?: string };
 export type Skipped = { txnId: string; order: string; status: string; amount: number; reason: string };
 export type Settlement = { rows: Row[]; skipped: Skipped[]; problems: string[]; counts: Record<string, number> };
 
@@ -49,7 +49,16 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
     if (!order) continue;
     const t = String(d["Linked Transaction Type"] || "").toLowerCase();
     const type: "sale" | "refund" = /refund|credit/.test(t) || /refund/i.test(link) ? "refund" : "sale";
-    const amount = num(d["File Amount"] !== "" && d["File Amount"] != null ? d["File Amount"] : d["Line Amount"]);
+    const lineAmount = taxAmount(d["Line Amount"]);
+    const fileAmount = taxAmount(d["File Amount"]);
+    if (fileAmount === null && lineAmount === null) {
+      problems.push(`Order ${order} has no usable amount in File Amount or Line Amount.`);
+      continue;
+    }
+    const amount = fileAmount ?? lineAmount!;
+    const reviewReason = "File Amount" in d && fileAmount === null
+      ? "File Amount is missing. The uploaded Line Amount can be compared but cannot authorize a QuickBooks change."
+      : undefined;
     const k = `${type}:${link}:${Math.abs(amount)}:${d["Deposit No"]}:${d["Date"]}`;
     if (seen.has(k)) { problems.push(`Order ${order} appears more than once with the same ${type} amount (${amount.toFixed(2)}). Check the file.`); continue; }
     seen.add(k);
@@ -59,7 +68,7 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
       (/^\s*(?:-|\(|\$-)/.test(String(legacyRefundTax ?? "")) ? taxAmount(legacyRefundTax) : null);
     const legacyRefundZeroTax = type === "refund" && refundTax === null &&
       (legacyRefundTax === 0 || /^\s*0(?:\.0+)?\s*$/.test(String(legacyRefundTax ?? "")));
-    rows.push({ order, type, legacyRefundZeroTax, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: type === "refund" ? refundTax : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
+    rows.push({ order, type, legacyRefundZeroTax, lineAmount: lineAmount ?? undefined, reviewReason, amount: type === "refund" ? -amount : amount, fileTax: type === "refund" ? refundTax : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
       date: String(d["Date"] || ""), depositNo: String(d["Deposit No"] || ""), receivedFrom: String(d["Received From"] || "") });
   }
   flagRepeatedOrders(rows);
@@ -82,7 +91,7 @@ export function parseSettlement(buf: ArrayBuffer): Settlement {
     // Accounting formats can display a stored zero as a dash. Preserve numeric tax cells.
     for (let c = s.c; c <= e.c; c++) {
       const header = sheet[XLSX.utils.encode_cell({ r: s.r, c })]?.v;
-      if (header !== "Order Total Tax Amount" && header !== "Refund Tax Amount" && header !== "L2 - Tax") continue;
+      if (header !== "Order Total Tax Amount" && header !== "Refund Tax Amount" && header !== "L2 - Tax" && header !== "Line Amount" && header !== "File Amount") continue;
       for (const row of rows) {
         const cell = sheet[XLSX.utils.encode_cell({ r: row.__rowNum__, c })];
         if (cell?.t === "n") row[header] = cell.v;

@@ -18,7 +18,6 @@ export const POST = handler(async (req: Request) => {
   const link = qbLink(row.type, original.id);
   const tax = before.fileTax;
   const adjustment = before.plan.adjustment;
-  const shipping = before.plan.untaxShipping;
   const steps: FixStep[] = [];
   if (process.env.TAX_OVERRIDE_API !== "no") {
     if (!adjustment) steps.push({ kind: "total", tax });
@@ -27,17 +26,16 @@ export const POST = handler(async (req: Request) => {
   } else if (adjustment && !before.plan.tax) {
     steps.push({ kind: "lines", tax });
   }
-  if (shipping) steps.push({ kind: "shipping", tax, shippingId: shipping.itemId });
-  if (before.plan.tax?.mode === "remove") steps.push({ kind: "remove", tax });
 
   const tried: string[] = [];
   let observed = original;
+  let observedAt = before.checkedAt;
   let current = original;
   let changed = false;
   let unconfirmed = false;
   let lastIssue = "";
   let compensated = false;
-  const view = (receipt: QDoc) => ({ ...reconcile(row, receipt, adjustment), link });
+  const view = (receipt: QDoc) => ({ ...reconcile(row, receipt, adjustment), link, checkedAt: observedAt });
   const adjustmentTotal = (receipt: QDoc) => receipt.lines
     .filter((line) => line.itemId === adjustment?.id && line.taxCode === "NON")
     .reduce((sum, line) => sum + line.amount, 0);
@@ -46,7 +44,8 @@ export const POST = handler(async (req: Request) => {
 
   async function readCurrent() {
     observed = await reread(row.type, original.id);
-    if (String(observed.syncToken) !== String(current.syncToken)) throw new Error("QuickBooks returned a different receipt version. Check the current receipt.");
+    observedAt = new Date().toISOString();
+    if (observed.docNumber !== original.docNumber || String(observed.syncToken) !== String(current.syncToken)) throw new Error("QuickBooks returned a different receipt version. Check the current receipt.");
   }
 
   function recordError(step: string, error: unknown) {
@@ -63,7 +62,9 @@ export const POST = handler(async (req: Request) => {
       current = await applyTaxStep(current, original, step, adjustment);
       await readCurrent();
       const after = view(observed);
-      if (verified(after) && (!adjustment || sameMoney(adjustmentTotal(observed) - adjustmentTotal(original), adjustment.amount))) {
+      if (verified(after) && (adjustment
+        ? sameMoney(adjustmentTotal(observed) - adjustmentTotal(original), adjustment.amount)
+        : sameReceiptLines(observed, original))) {
         return { before, after, verified: true, applied: true, link, message: "Tax and total saved and verified." };
       }
       if (tax > 0 && after.taxDiff === after.totalDiff && Math.abs(after.totalDiff) === 0.01) roundingDifference = after.totalDiff;
@@ -86,7 +87,7 @@ export const POST = handler(async (req: Request) => {
         recordError("restore", error);
         unconfirmed = true;
         // Never use a fresh SyncToken to overwrite a concurrent edit.
-        try { observed = await reread(row.type, original.id); } catch { /* Keep the last known figures. */ }
+        try { observed = await reread(row.type, original.id); observedAt = new Date().toISOString(); } catch { /* Keep the last known figures. */ }
       }
       if (unconfirmed) break;
     }

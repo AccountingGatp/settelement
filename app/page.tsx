@@ -23,7 +23,7 @@ type ReadOut = {
 };
 type St = { connected: boolean; companyName: string; environment: string; writesAllowed: boolean };
 
-const money = (n: number | null) => n === null ? "–" : n.toFixed(2);
+const money = (n?: number | null) => n == null ? "–" : n.toFixed(2);
 const key = (r: Row) => JSON.stringify([r.type, r.order, r.txnId, r.docNumber, r.amount, r.date]);
 const chipClass = (s: string) => s.split(/[ ,]/)[0];
 async function post(url: string, body: unknown) {
@@ -50,6 +50,7 @@ export default function Home() {
   const [open, setOpen] = useState<string | null>(null);
   const cancel = useRef(false);
   const [fixing, setFixing] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     fetch("/api/qb/status").then((r) => r.json()).then(setSt).catch(() => {});
@@ -92,7 +93,7 @@ export default function Home() {
   }
 
   function blankFor(row: Row): Result {
-    return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", settle: Math.abs(row.amount), fileTax: row.fileTax, qboTotal: 0, qboTax: 0, taxDiff: null, totalDiff: 0, inDeposit: false, issues: [], plan: {}, blockers: [], notes: [] };
+    return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", lineAmount: row.lineAmount, settle: Math.abs(row.amount), fileTax: row.fileTax, qboTotal: 0, qboTax: 0, taxDiff: null, totalDiff: 0, inDeposit: false, issues: [], plan: {}, blockers: [], notes: [] };
   }
 
   async function fixOne(row: Row) {
@@ -128,7 +129,7 @@ export default function Home() {
       setRes((p) => {
         const previous = p[k];
         if (previous?.final === "Failed" && previous.tried) {
-          if (v.status === "Matched") {
+          if (v.status === "Matched" || (v.status === "Line amount differs" && v.receiptId === previous.receiptId)) {
             return { ...p, [k]: { ...v, before: previous.before ?? previous, final: "Corrected, verified" } };
           }
           if (v.status === "Needs fix") {
@@ -174,9 +175,49 @@ export default function Home() {
   }
 
   async function report() {
-    const r = await fetch("/api/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ results: (read ? read.rows : []).map((r) => res[key(r)]).filter(Boolean) }) });
-    if (!r.ok) return setErr("Could not build the report.");
-    const a = document.createElement("a"); a.href = URL.createObjectURL(await r.blob()); const cd = r.headers.get("Content-Disposition") || ""; a.download = (cd.match(/filename="([^"]+)"/) || [])[1] || "output.xlsx"; a.click();
+    if (!read) return;
+    setErr("");
+    setExporting(true);
+    cancel.current = false;
+    const label = "Verifying every receipt for Excel";
+    const latest: Record<string, Result> = {};
+    let done = 0;
+    setProgress({ done, total: read.rows.length, label });
+    try {
+      await pool(read.rows, 2, async (row) => {
+        const k = key(row), previous = res[k];
+        try {
+          const fresh = (await post("/api/check", { row: withPrefix(row) })) as Verdict;
+          const sameReceipt = !!fresh.receiptId && fresh.receiptId === previous?.receiptId;
+          const stillCorrected = sameReceipt && (fresh.status === "Matched" || fresh.status === "Line amount differs") &&
+            previous?.final === "Corrected, verified";
+          latest[k] = {
+            ...fresh, before: previous?.before ?? (previous?.checkedAt ? previous : undefined),
+            final: stillCorrected ? "Corrected, verified" : sameReceipt && previous?.final === "Skipped" && fresh.status === "Needs fix" ? "Skipped" : undefined,
+            reason: previous?.final === "Corrected, verified" && !stillCorrected
+              ? "A fresh QuickBooks read no longer confirms the correction." : undefined,
+          };
+        } catch (e) {
+          latest[k] = { ...blankFor(row), error: e instanceof Error ? e.message : String(e) };
+        }
+        setProgress({ done: ++done, total: read.rows.length, label });
+      }, () => cancel.current);
+      if (cancel.current) return;
+      setRes(latest);
+      setTab(null);
+      const r = await fetch("/api/report", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ results: read.rows.map((row) => latest[key(row)]) }),
+      });
+      if (!r.ok) throw new Error("Could not build the report.");
+      const url = URL.createObjectURL(await r.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || "output.xlsx";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+    finally { setProgress(null); setExporting(false); }
   }
 
   const list = useMemo(() => (read ? read.rows.map((r) => ({ row: r, v: res[key(r)] })) : []), [read, res]);
@@ -192,7 +233,7 @@ export default function Home() {
   const checked = Object.keys(res).length;
   const matched = groups.Matched.length;
   const corrected = groups.Corrected.length;
-  const activeTab = progress ? "Fixes needed" : tab ??
+  const activeTab = exporting ? "Download" : progress ? "Fixes needed" : tab ??
     (needFix ? "Fixes needed" : failed ? "Failed" : review ? "Review needed" : "Download");
   const tabCounts: Record<Tab, number | null> = { "Fixes needed": needFix, Failed: failed, "Review needed": review, Matched: matched, Corrected: corrected, Download: null };
   const canFix = !!st?.writesAllowed;
@@ -200,19 +241,20 @@ export default function Home() {
 
   const renderTable = (items: { row: Row; v?: Result }[], showActions = true) => (
               <div className="table-scroll"><table>
-                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">File amount</th><th className="num">QBO total</th><th className="num">File tax</th><th className="num">QBO tax</th><th className="num">Tax diff</th><th className="num">Total diff</th><th>Details</th>{showActions && <th>Actions</th>}</tr></thead>
+                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">File amount</th><th className="num">Uploaded line</th><th className="num">QBO total</th><th className="num">File tax</th><th className="num">QBO tax</th><th className="num">Tax diff</th><th className="num">Total diff</th><th className="num">Line diff</th><th>Details</th>{showActions && <th>Actions</th>}</tr></thead>
                 <tbody>
                   {items.map(({ row, v }) => v ? (
-                    <Fragment2 key={key(row)} open={open === key(row)} columns={showActions ? 11 : 10}
+                    <Fragment2 key={key(row)} open={open === key(row)} columns={showActions ? 13 : 12}
                       cells={<>
                         <td>{v.link ? <a className="receipt-link" href={v.link} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{v.order}</a> : <b>{v.order}</b>}</td><td>{v.type === "sale" ? "Sale" : "Refund"}</td>
                         <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span></td>
-                        <td className="num">{money(v.settle)}</td><td className="num">{v.status === "Not found" || v.error ? "–" : money(v.qboTotal)}</td>
+                        <td className="num">{money(v.settle)}</td><td className="num">{money(v.lineAmount)}</td><td className="num">{v.status === "Not found" || v.error ? "–" : money(v.qboTotal)}</td>
                         <td className="num">{money(v.fileTax)}</td><td className="num">{v.status === "Not found" || v.error ? "–" : money(v.qboTax)}</td>
                         <td className="num">{v.status === "Not found" ? "–" : money(v.taxDiff)}</td>
                         <td className="num">{v.status === "Not found" || v.error ? "–" : money(v.totalDiff)}</td>
+                        <td className="num">{money(v.lineDiff)}</td>
                         <td className="small">{summary(v)}
-                          {showActions && (v.final === "Failed" || v.blockers.length > 0 || v.issues.length > 0) &&
+                          {showActions && (v.final === "Failed" || v.blockers.length > 0 || v.issues.length > 0 || !!v.lineDiff || !!v.reason) &&
                             <button type="button" className="link receipt-details" aria-expanded={open === key(row)}
                               onClick={() => setOpen(open === key(row) ? null : key(row))}>{open === key(row) ? "Hide details" : "View details"}</button>}
                         </td>
@@ -232,6 +274,7 @@ export default function Home() {
                           save the receipt, then select Check again. <a href={v.link} target="_blank" rel="noreferrer">Open receipt</a>
                         </p>}
                         {!!v.tried?.length && <ul>{v.tried.map((attempt, index) => <li key={index}>{attempt}</li>)}</ul>}
+                        {v.checkedAt && <p className="small">Read from QuickBooks at {new Date(v.checkedAt).toLocaleString()}.</p>}
                         {v.inDeposit && <p className="small">Linked to a QuickBooks deposit.</p>}
                         {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
                         {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: File {i.file}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
@@ -298,8 +341,8 @@ export default function Home() {
               <h3>Download results</h3>
               <p>{corrected} corrected · {matched} matched · {failed + review + needFix} unresolved{read && read.rows.length > checked ? ` · ${read.rows.length - checked} unchecked` : ""}</p>
               <div className="row-actions">
-                <button className="btn" onClick={report}>Download Excel</button>
-                {failed + review + needFix > 0 && <button className="btn ghost" onClick={needsPerson}>Download exceptions CSV</button>}
+                <button className="btn" disabled={working} onClick={report}>Verify and download Excel</button>
+                {failed + review + needFix > 0 && <button className="btn ghost" disabled={working} onClick={needsPerson}>Download exceptions CSV</button>}
               </div>
             </div>
           ) : (
@@ -330,13 +373,13 @@ export default function Home() {
 function summary(v: Result) {
   if (v.final === "Corrected, verified") return "Saved and verified";
   if (v.final === "Failed" || v.error) return v.error || v.message || "QuickBooks could not complete this receipt.";
+  if (v.status === "Line amount differs") return "The settlement matches QuickBooks. The uploaded Line Amount differs from the current receipt total.";
   if (v.status === "Pending review" || v.status === "Not found") return v.blockers[0] || v.error || "";
   if (v.plan.adjustment) return `Adjust the pre-tax refund by ${money(v.plan.adjustment.amount)} using ${v.plan.adjustment.name}.`;
   if (!v.plan.tax) return "";
   const pv = v.plan.preview, d = pv ? pv.taxTo - pv.taxFrom : 0;
   const amt = pv ? ` Tax ${money(pv.taxFrom)} → ${money(pv.taxTo)} (${d >= 0 ? "+" : "−"}${money(Math.abs(d))}); total ${money(pv.totalFrom)} → ${money(pv.totalTo)}.` : "";
-  if (v.plan.tax.mode === "remove") return "Remove tax (untick Taxable on every line)." + amt;
-  return (v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable.` : "Override the tax amount.") + amt;
+  return "Override total tax." + amt;
 }
 
 function Fragment2({ cells, detail, open, columns }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; columns: number }) {

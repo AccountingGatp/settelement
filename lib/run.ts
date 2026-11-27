@@ -1,16 +1,24 @@
 // One row, end to end: look up QuickBooks, compare with the file. Shared by the check and fix routes.
-import { findDoc, findRefundAdjustmentItem, qbLink } from "./qb";
+import { findDoc, findRefundAdjustmentItem, qbLink, reread } from "./qb";
 import { reconcile, type Verdict } from "./recon";
 import type { Row } from "./settlement";
 
 export async function checkRow(row: Row): Promise<{ verdict: Verdict; doc: Awaited<ReturnType<typeof findDoc>> }> {
-  const doc = await findDoc(row.type, row.order, row.prefix, row.docNumber);
+  const lookup = await findDoc(row.type, row.order, row.prefix, row.docNumber);
+  const doc = lookup ? await reread(row.type, lookup.id) : null;
+  if (doc && doc.docNumber !== lookup?.docNumber) throw new Error("The QuickBooks receipt number changed during lookup. Check this order again.");
   const comparison = reconcile(row, doc);
   const needsRefundItem = !!doc && row.type === "refund" && !row.reviewReason &&
     comparison.issues.some((issue) => issue.field === "Amount before tax");
   const item = needsRefundItem ? await findRefundAdjustmentItem() : undefined;
   const verdict = item ? reconcile(row, doc, item) : comparison;
-  if (doc) verdict.link = qbLink(row.type, doc.id);
+  if (doc) {
+    verdict.checkedAt = new Date().toISOString();
+    verdict.link = qbLink(row.type, doc.id);
+    if (verdict.status === "Matched" && verdict.lineDiff) {
+      verdict.status = "Line amount differs";
+    }
+  }
   return { verdict, doc };
 }
 
@@ -24,6 +32,7 @@ export function parseRow(body: any): Row {
   const docNumber = typeof r.docNumber === "string" && r.docNumber.length <= 100 && r.docNumber.match(/\d+$/)?.[0] === order ? r.docNumber : undefined;
   return {
     order, type: r.type, amount: Number(r.amount), fileTax, docNumber,
+    lineAmount: typeof r.lineAmount === "number" && Number.isFinite(r.lineAmount) ? Math.abs(r.lineAmount) : undefined,
     legacyRefundZeroTax: r.type === "refund" && r.legacyRefundZeroTax === true,
     fileFreight: Number(r.fileFreight || 0), txnId: String(r.txnId || ""),
     customer: String(r.customer || ""), date: String(r.date || ""), depositNo: String(r.depositNo || ""), receivedFrom: String(r.receivedFrom || ""),
