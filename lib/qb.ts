@@ -226,13 +226,28 @@ export async function reread(kind: Kind, id: string): Promise<QDoc> {
   return view(kind, j[ENTITY[kind]]);
 }
 
-// ---------------------------------------------------------------- changes (approved tax fixes only)
-export type FixStep = { kind: "remove" } | { kind: "shipping"; itemId: string } | { kind: "total" | "override"; tax: number };
+// ---------------------------------------------------------------- receipt corrections
+export async function findRefundAdjustmentItem(): Promise<{ id: string; name: string } | undefined> {
+  const name = process.env.QB_REFUND_ADJUSTMENT_ITEM?.trim();
+  if (!name) return undefined;
+  const items = await queryAll("Item", `where Name = '${esc(name)}'`);
+  const item = items.length === 1 ? items[0] : null;
+  if (!item || item.Active !== true || !["Service", "NonInventory"].includes(item.Type) || !item.IncomeAccountRef?.value) {
+    throw new Error(`QuickBooks refund adjustment item “${name}” must be a unique, active service or non-inventory item with an income account.`);
+  }
+  return { id: String(item.Id), name: String(item.Name) };
+}
 
-const receiptLines = (doc: QDoc) => (doc.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
+export type FixStep = { kind: "total" | "lines" | "override" | "shipping" | "remove"; tax: number; shippingId?: string };
+type Adjustment = { id: string; name: string; amount: number };
+const receiptLines = (doc: QDoc): any[] => (doc.raw.Line || []).filter((l: any) => l.DetailType !== "SubTotalLineDetail");
 const taxCode = (line: any, code: string) => ({
   ...line, SalesItemLineDetail: { ...line.SalesItemLineDetail, TaxCodeRef: { value: code } },
 });
+const totalTaxDetail = (doc: QDoc, tax: number) => {
+  const code = doc.raw.TxnTaxDetail?.TxnTaxCodeRef;
+  return { ...(code ? { TxnTaxCodeRef: code } : {}), TotalTax: tax };
+};
 
 async function saveReceipt(doc: QDoc, fields: Record<string, unknown>): Promise<QDoc> {
   assertWritable();
@@ -240,35 +255,45 @@ async function saveReceipt(doc: QDoc, fields: Record<string, unknown>): Promise<
   return view(doc.kind, result[ENTITY[doc.kind]]);
 }
 
-export function applyTaxStep(doc: QDoc, step: FixStep): Promise<QDoc> {
-  if (step.kind === "total") {
-    const code = doc.raw.TxnTaxDetail?.TxnTaxCodeRef;
-    return saveReceipt(doc, { TxnTaxDetail: { ...(code ? { TxnTaxCodeRef: code } : {}), TotalTax: step.tax } });
-  }
-  const lines = receiptLines(doc);
-  if (step.kind === "override") {
-    return saveReceipt(doc, { Line: lines, TxnTaxDetail: retargetTax(doc.raw.TxnTaxDetail, step.tax) });
-  }
-  if (step.kind === "remove") {
-    return saveReceipt(doc, {
-      Line: lines.map((line: any) => line.DetailType === "SalesItemLineDetail" ? taxCode(line, "NON") : line),
-      TxnTaxDetail: { TotalTax: 0 },
+/** Compare the amounts and codes on the original economic lines, ignoring QBO-generated subtotals and ordering. */
+export function sameReceiptLines(a: QDoc, b: QDoc): boolean {
+  const signatures = (doc: QDoc) => doc.lines.filter((line) => line.kind !== "subtotal").map((line) =>
+    JSON.stringify([line.kind, line.itemId, round2(line.amount), line.qty, line.rate, line.taxCode])).sort();
+  return JSON.stringify(signatures(a)) === JSON.stringify(signatures(b));
+}
+
+export function applyTaxStep(doc: QDoc, baseline: QDoc, step: FixStep, adjustment?: Adjustment): Promise<QDoc> {
+  const td = totalTaxDetail(baseline, step.tax);
+  if (step.kind === "total" && !adjustment && sameReceiptLines(doc, baseline)) return saveReceipt(doc, { TxnTaxDetail: td });
+  const lines = receiptLines(baseline).map((line) => {
+    if (!line.SalesItemLineDetail) return line;
+    if (step.kind === "remove" || (step.kind === "shipping" && line.SalesItemLineDetail.ItemRef?.value === step.shippingId)) {
+      return taxCode(line, "NON");
+    }
+    return line;
+  });
+  if (adjustment) {
+    // Rebuild from the starting receipt so every attempt targets the same total.
+    // Reuse a line ID if a previous attempt already appended the adjustment.
+    const existingIds = new Set(lines.map((line) => line.Id).filter(Boolean));
+    const prior = receiptLines(doc).find((line) => line.Id && !existingIds.has(line.Id) &&
+      String(line.SalesItemLineDetail?.ItemRef?.value) === adjustment.id);
+    lines.push({
+      ...(prior ? { Id: prior.Id } : {}),
+      DetailType: "SalesItemLineDetail", Amount: adjustment.amount, Description: "Settlement refund adjustment",
+      SalesItemLineDetail: { ItemRef: { value: adjustment.id }, Qty: 1, UnitPrice: adjustment.amount, TaxCodeRef: { value: "NON" } },
     });
   }
-  if (step.kind === "shipping") {
-    const index = lines.findIndex((line: any) => line.SalesItemLineDetail?.ItemRef?.value === step.itemId);
-    if (index < 0) throw new Error("The shipping item is no longer on the receipt.");
-    lines[index] = taxCode(lines[index], "NON");
-  }
-  return saveReceipt(doc, { Line: lines });
+  const sourceTax = doc.raw.TxnTaxDetail?.TaxLine?.length ? doc.raw.TxnTaxDetail : baseline.raw.TxnTaxDetail;
+  return saveReceipt(doc, { Line: lines, TxnTaxDetail: step.kind === "override" ? retargetTax(sourceTax, step.tax) : td });
 }
 
-export function recalc(doc: QDoc): Promise<QDoc> {
-  return saveReceipt(doc, { Line: receiptLines(doc) });
-}
-
-export function restore(doc: QDoc, original: QDoc): Promise<QDoc> {
-  return saveReceipt(doc, { Line: receiptLines(original), TxnTaxDetail: original.raw.TxnTaxDetail || { TotalTax: 0 } });
+export function restore(doc: QDoc, original: QDoc, exactDetail: boolean): Promise<QDoc> {
+  const detail = exactDetail ? original.raw.TxnTaxDetail : totalTaxDetail(original, original.tax);
+  return saveReceipt(doc, {
+    ...(sameReceiptLines(doc, original) ? {} : { Line: receiptLines(original) }),
+    TxnTaxDetail: detail || { TotalTax: 0 },
+  });
 }
 
 /** Spread a new total tax over the receipt's tax lines (in proportion to what each holds) and record the difference on each line as the

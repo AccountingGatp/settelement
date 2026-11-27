@@ -1,11 +1,15 @@
 // One row, end to end: look up QuickBooks, compare with the file. Shared by the check and fix routes.
-import { findDoc, qbLink } from "./qb";
+import { findDoc, findRefundAdjustmentItem, qbLink } from "./qb";
 import { reconcile, type Verdict } from "./recon";
 import type { Row } from "./settlement";
 
 export async function checkRow(row: Row): Promise<{ verdict: Verdict; doc: Awaited<ReturnType<typeof findDoc>> }> {
   const doc = await findDoc(row.type, row.order, row.prefix, row.docNumber);
-  const verdict = reconcile(row, doc);
+  const comparison = reconcile(row, doc);
+  const needsRefundItem = !!doc && row.type === "refund" && !row.reviewReason &&
+    comparison.issues.some((issue) => issue.field === "Amount before tax");
+  const item = needsRefundItem ? await findRefundAdjustmentItem() : undefined;
+  const verdict = item ? reconcile(row, doc, item) : comparison;
   if (doc) verdict.link = qbLink(row.type, doc.id);
   return { verdict, doc };
 }

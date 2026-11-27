@@ -53,7 +53,11 @@ function parseOutputSheet(data: Record<string, unknown>[]): Settlement {
     const k = `${type}:${link}:${Math.abs(amount)}:${d["Deposit No"]}:${d["Date"]}`;
     if (seen.has(k)) { problems.push(`Order ${order} appears more than once with the same ${type} amount (${amount.toFixed(2)}). Check the file.`); continue; }
     seen.add(k);
-    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: type === "refund" ? taxAmount(d["Refund Tax Amount"]) : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
+    const legacyRefundTax = d["Order Total Tax Amount"];
+    // The signed tax on the team's refund rows is a refund figure. An unsigned legacy value may be the original sale's tax.
+    const refundTax = taxAmount(d["Refund Tax Amount"]) ??
+      (/^\s*(?:-|\(|\$-)/.test(String(legacyRefundTax ?? "")) ? taxAmount(legacyRefundTax) : null);
+    rows.push({ order, type, amount: type === "refund" ? -Math.abs(amount) : amount, fileTax: type === "refund" ? refundTax : num(d["Order Total Tax Amount"]), docNumber: link, fileFreight: 0, txnId: String(d["Deposit No"] || ""), customer: String(d["Received From"] || "").replace(/\s*\(.*\)\s*$/, ""),
       date: String(d["Date"] || ""), depositNo: String(d["Deposit No"] || ""), receivedFrom: String(d["Received From"] || "") });
   }
   flagRepeatedOrders(rows);
