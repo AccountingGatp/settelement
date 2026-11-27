@@ -155,5 +155,4 @@ main.wide { max-width: 1280px; padding-top: 28px; }
 .download-panel { border-radius: 10px; background: #f6faf8; padding: 18px; margin-top: 16px; }
 .download-panel h3 { margin: 0; font-size: 16px; }
 .download-panel p { margin: 5px 0; color: var(--muted); font-size: 14px; }
-.completed-receipts { margin-top: 16px; }
-.completed-receipts summary { cursor: pointer; color: var(--brand); font-size: 14px; font-weight: 600; }
+.receipt-details { display: block; margin-top: 4px; color: var(--brand); }

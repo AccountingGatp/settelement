@@ -5,14 +5,15 @@ import { parseSettlement, type Row } from "@/lib/settlement";
 import type { Verdict } from "@/lib/recon";
 
 type Result = Verdict & { final?: string; before?: Verdict; error?: string; message?: string; reason?: string; tried?: string[] };
-const tabs = ["Fixes needed", "Failed", "Review needed", "Download"] as const;
+const tabs = ["Fixes needed", "Failed", "Review needed", "Matched", "Corrected", "Download"] as const;
 type Tab = typeof tabs[number];
 
 function tabFor(result: Result): Tab {
   if (result.error || result.final === "Failed") return "Failed";
   if (result.final === "Skipped") return "Review needed";
   if (result.status === "Needs fix" && !result.final) return "Fixes needed";
-  if (result.status === "Matched" || result.final === "Corrected, verified") return "Download";
+  if (result.final === "Corrected, verified") return "Corrected";
+  if (result.status === "Matched") return "Matched";
   return "Review needed";
 }
 
@@ -103,7 +104,7 @@ export default function Home() {
         ...p,
         [k]: {
           ...j.after, before: j.verified || j.applied ? j.before : undefined, final: fin || undefined,
-          message: j.message, reason: j.reason, link: j.link || j.after.link, tried: j.tried,
+          message: j.message, reason: j.reason, link: j.link || j.after.link, tried: j.tried, taxToEnter: j.taxToEnter,
         },
       }));
     } catch (e) {
@@ -124,7 +125,19 @@ export default function Home() {
     setTab(null);
     try {
       const v = (await post("/api/check", { row: withPrefix(row) })) as Verdict;
-      setRes((p) => ({ ...p, [k]: v }));
+      setRes((p) => {
+        const previous = p[k];
+        if (previous?.final === "Failed" && previous.tried) {
+          if (v.status === "Matched") {
+            return { ...p, [k]: { ...v, before: previous.before ?? previous, final: "Corrected, verified" } };
+          }
+          if (v.status === "Needs fix") {
+            return { ...p, [k]: { ...v, before: previous.before, final: "Failed", message: previous.message,
+              reason: previous.reason, tried: previous.tried, taxToEnter: previous.taxToEnter } };
+          }
+        }
+        return { ...p, [k]: v };
+      });
     } catch (e) {
       setRes((p) => ({ ...p, [k]: { ...p[k], final: "Failed", error: e instanceof Error ? e.message : String(e) } }));
     } finally { setFixing(false); }
@@ -153,10 +166,10 @@ export default function Home() {
   /** Every row that is not matched or fixed, with the reason and the exact change it needs, so nothing is lost. */
   function needsPerson() {
     const q = (x: string) => `"${String(x ?? "").replace(/"/g, '""')}"`;
-    const rows = Object.values(res).filter((v) => tabFor(v) !== "Download");
+    const rows = Object.values(res).filter((v) => !["Matched", "Corrected"].includes(tabFor(v)));
     const head = ["Order", "Type", "Status", "File amount", "File tax", "QBO total", "QBO tax", "TaxDiff", "Change needed", "Reason"];
     const lines = rows.map((v) => [v.order, v.type, v.final || v.status, money(v.settle), money(v.fileTax), v.status === "Not found" ? "" : money(v.qboTotal), v.status === "Not found" ? "" : money(v.qboTax), v.status === "Not found" ? "" : money(v.taxDiff),
-      v.final === "Skipped" ? "Skipped: " + summary({ ...v, final: undefined }) : summary(v), [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | ")].map(q).join(","));
+      v.final === "Skipped" ? "Skipped: " + summary({ ...v, final: undefined }) : summary(v), [v.reason, v.error, ...(v.tried || []), ...v.blockers].filter(Boolean).join(" | ")].map(q).join(","));
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([[head.map(q).join(","), ...lines].join("\n")], { type: "text/csv" })); a.download = "needs-a-person.csv"; a.click();
   }
 
@@ -169,7 +182,7 @@ export default function Home() {
   const list = useMemo(() => (read ? read.rows.map((r) => ({ row: r, v: res[key(r)] })) : []), [read, res]);
   const label = (x: Result) => x.final || x.status;
   const groups = useMemo(() => {
-    const byTab: Record<Tab, typeof list> = { "Fixes needed": [], Failed: [], "Review needed": [], Download: [] };
+    const byTab: Record<Tab, typeof list> = { "Fixes needed": [], Failed: [], "Review needed": [], Matched: [], Corrected: [], Download: [] };
     for (const entry of list) if (entry.v) byTab[tabFor(entry.v)].push(entry);
     return byTab;
   }, [list]);
@@ -177,20 +190,20 @@ export default function Home() {
   const failed = groups.Failed?.length ?? 0;
   const review = groups["Review needed"]?.length ?? 0;
   const checked = Object.keys(res).length;
-  const completed = groups.Download || [];
-  const corrected = completed.filter(({ v }) => v.final === "Corrected, verified");
-  const activeTab = progress || fixing ? "Fixes needed" : tab ??
+  const matched = groups.Matched.length;
+  const corrected = groups.Corrected.length;
+  const activeTab = progress ? "Fixes needed" : tab ??
     (needFix ? "Fixes needed" : failed ? "Failed" : review ? "Review needed" : "Download");
-  const tabCounts: Record<Tab, number | null> = { "Fixes needed": needFix, Failed: failed, "Review needed": review, Download: null };
+  const tabCounts: Record<Tab, number | null> = { "Fixes needed": needFix, Failed: failed, "Review needed": review, Matched: matched, Corrected: corrected, Download: null };
   const canFix = !!st?.writesAllowed;
   const working = !!progress || fixing;
 
-  const renderTable = (items: { row: Row; v?: Result }[]) => (
+  const renderTable = (items: { row: Row; v?: Result }[], showActions = true) => (
               <div className="table-scroll"><table>
-                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">File amount</th><th className="num">QBO total</th><th className="num">File tax</th><th className="num">QBO tax</th><th className="num">Tax diff</th><th className="num">Total diff</th><th>Details</th><th>Actions</th></tr></thead>
+                <thead><tr><th>Order</th><th>Type</th><th>Status</th><th className="num">File amount</th><th className="num">QBO total</th><th className="num">File tax</th><th className="num">QBO tax</th><th className="num">Tax diff</th><th className="num">Total diff</th><th>Details</th>{showActions && <th>Actions</th>}</tr></thead>
                 <tbody>
                   {items.map(({ row, v }) => v ? (
-                    <Fragment2 key={key(row)} open={open === key(row)} onToggle={() => setOpen(open === key(row) ? null : key(row))}
+                    <Fragment2 key={key(row)} open={open === key(row)} columns={showActions ? 11 : 10}
                       cells={<>
                         <td>{v.link ? <a className="receipt-link" href={v.link} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{v.order}</a> : <b>{v.order}</b>}</td><td>{v.type === "sale" ? "Sale" : "Refund"}</td>
                         <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span></td>
@@ -198,18 +211,26 @@ export default function Home() {
                         <td className="num">{money(v.fileTax)}</td><td className="num">{v.status === "Not found" || v.error ? "–" : money(v.qboTax)}</td>
                         <td className="num">{v.status === "Not found" ? "–" : money(v.taxDiff)}</td>
                         <td className="num">{v.status === "Not found" || v.error ? "–" : money(v.totalDiff)}</td>
-                        <td className="small">{summary(v)}</td>
-                        <td className="nowrap">
+                        <td className="small">{summary(v)}
+                          {showActions && (v.final === "Failed" || v.blockers.length > 0 || v.issues.length > 0) &&
+                            <button type="button" className="link receipt-details" aria-expanded={open === key(row)}
+                              onClick={() => setOpen(open === key(row) ? null : key(row))}>{open === key(row) ? "Hide details" : "View details"}</button>}
+                        </td>
+                        {showActions && <td className="nowrap">
                           {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix || !!progress || fixing} onClick={(e) => { e.stopPropagation(); fixSingle(row); }}>Fix</button> <button className="btn small ghost" disabled={!!progress || fixing} onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
                           {v.final === "Skipped" && <button className="btn small ghost" disabled={!!progress || fixing} onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
                           {(tabFor(v) === "Failed" || (tabFor(v) === "Review needed" && v.final !== "Skipped")) && <button className="btn small" disabled={!!progress || fixing} onClick={(e) => { e.stopPropagation(); recheckOne(row); }}>Check again</button>}
 
-                        </td>
+                        </td>}
                       </>}
                       detail={<div>
                         {v.error && <div className="alert">{v.error}</div>}
                         {v.message && <p className="small">{v.message}</p>}
                         {v.reason && <p className="small">{v.reason}</p>}
+                        {v.taxToEnter !== undefined && v.link && <p className="small">
+                          Open QuickBooks and use <strong>See the math → Override this amount</strong>. Enter <strong>{money(v.taxToEnter)}</strong> for tax,
+                          save the receipt, then select Check again. <a href={v.link} target="_blank" rel="noreferrer">Open receipt</a>
+                        </p>}
                         {!!v.tried?.length && <ul>{v.tried.map((attempt, index) => <li key={index}>{attempt}</li>)}</ul>}
                         {v.inDeposit && <p className="small">Linked to a QuickBooks deposit.</p>}
                         {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
@@ -275,16 +296,15 @@ export default function Home() {
           {activeTab === "Download" ? (
             <div className="download-panel">
               <h3>Download results</h3>
-              <p>{corrected.length} corrected · {completed.length - corrected.length} matched · {failed + review + needFix} unresolved{read && read.rows.length > checked ? ` · ${read.rows.length - checked} unchecked` : ""}</p>
+              <p>{corrected} corrected · {matched} matched · {failed + review + needFix} unresolved{read && read.rows.length > checked ? ` · ${read.rows.length - checked} unchecked` : ""}</p>
               <div className="row-actions">
                 <button className="btn" onClick={report}>Download Excel</button>
                 {failed + review + needFix > 0 && <button className="btn ghost" onClick={needsPerson}>Download exceptions CSV</button>}
               </div>
-              {completed.length > 0 && <details className="completed-receipts"><summary>View matched and corrected receipts</summary>{renderTable(completed)}</details>}
             </div>
           ) : (
             <>
-              {groups[activeTab]?.length ? renderTable(groups[activeTab]!) : !working && <p className="empty-state">No receipts in {activeTab.toLowerCase()}.</p>}
+              {groups[activeTab]?.length ? renderTable(groups[activeTab], activeTab !== "Matched" && activeTab !== "Corrected") : !working && <p className="empty-state">No receipts in {activeTab.toLowerCase()}.</p>}
               {activeTab === "Failed" && failed > 0 && <div className="workflow-next"><button className="btn ghost small" onClick={() => setTab(review ? "Review needed" : "Download")}>{review ? "Continue to Review needed" : "Continue to Download"}</button></div>}
               {activeTab === "Review needed" && review > 0 && <div className="workflow-next"><button className="btn ghost small" onClick={() => setTab("Download")}>Continue to Download</button></div>}
             </>
@@ -319,6 +339,6 @@ function summary(v: Result) {
   return (v.plan.untaxShipping ? `Make ${v.plan.untaxShipping.name} non-taxable.` : "Override the tax amount.") + amt;
 }
 
-function Fragment2({ cells, detail, open, onToggle }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; onToggle: () => void }) {
-  return (<><tr onClick={onToggle} style={{ cursor: "pointer" }}>{cells}</tr>{open && <tr className="detail"><td colSpan={11}>{detail}</td></tr>}</>);
+function Fragment2({ cells, detail, open, columns }: { cells: React.ReactNode; detail: React.ReactNode; open: boolean; columns: number }) {
+  return (<><tr>{cells}</tr>{open && <tr className="detail"><td colSpan={columns}>{detail}</td></tr>}</>);
 }
