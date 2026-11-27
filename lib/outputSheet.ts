@@ -6,21 +6,21 @@
 import ExcelJS from "exceljs";
 import type { Verdict } from "./recon";
 
-export type OutRow = Verdict & { final?: string; after?: Verdict; reason?: string; rolledBack?: boolean; error?: string };
+export type OutRow = Verdict & { final?: string; before?: Verdict; reason?: string; error?: string };
 
-const HEAD = ["Deposit No", "Deposit To Account", "Date", "Received From", "Linked Transaction Type", "Line Amount", "Currency Code", "Linked Transaction Number", "dattt", "File Amount", "Discount", "Order Total Tax Amount", "QBSalesTax", "TaxDiff"];
+const HEAD = ["Deposit No", "Deposit To Account", "Date", "Received From", "Linked Transaction Type", "Line Amount", "Currency Code", "Linked Transaction Number", "dattt", "File Amount", "Discount", "Order Total Tax Amount", "QBSalesTax", "TaxDiff", "Refund Tax Amount"];
 const NUM = '#,##0.00;\\(#,##0.00\\);"-"';
-const WIDTH = [10.875, 26.875, 11.875, 42.875, 22.875, 12.875, 8.875, 24.875, 11.875, 12.875, 10.875, 16.875, 12.875, 10.875];
+const WIDTH = [10.875, 26.875, 11.875, 42.875, 22.875, 12.875, 8.875, 24.875, 11.875, 12.875, 10.875, 16.875, 12.875, 10.875, 19];
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
 function figures(v: OutRow, when: "before" | "after") {
   const sign = v.type === "refund" ? -1 : 1;
-  const nf = v.status === "Not found";
-  const useAfter = when === "after" && !!v.after && !v.rolledBack;
-  const total = nf ? null : sign * (useAfter ? v.after!.qboTotal : v.qboTotal);
-  const qbTax = nf ? null : sign * (useAfter ? v.after!.qboTax : v.qboTax);
-  const fileTax = sign * v.fileTax;
-  return { sign, file: sign * Math.abs(v.settle), total, qbTax, fileTax };
+  const receipt = when === "before" ? v.before || v : v;
+  const nf = receipt.status === "Not found" || !!v.error;
+  const total = nf ? null : sign * receipt.qboTotal;
+  const qbTax = nf ? null : sign * receipt.qboTax;
+  const fileTax = v.fileTax == null ? null : sign * v.fileTax;
+  return { file: sign * Math.abs(v.settle), total, qbTax, fileTax };
 }
 
 function addSheet(wb: ExcelJS.Workbook, name: string, rows: OutRow[], when: "before" | "after", account: string) {
@@ -29,16 +29,17 @@ function addSheet(wb: ExcelJS.Workbook, name: string, rows: OutRow[], when: "bef
   WIDTH.forEach((w, i) => (ws.getColumn(i + 1).width = w));
   rows.forEach((v, i) => {
     const f = figures(v, when), n = i + 2;
-    const doc = (v.type === "sale" ? "Woo Order#" : "Woo Refund#") + v.order;
+    const doc = v.docNumber || (v.type === "sale" ? "Woo Order#" : "Woo Refund#") + v.order;
     const row = ws.addRow([
       v.depositNo || "", account, v.date || "", v.qboCustomer || v.receivedFrom || v.customer || "", v.type === "sale" ? "SalesReceipt" : "RefundReceipt",
       f.total ?? "", "USD", doc, v.date || "", f.file,
-      f.total == null ? "" : { formula: `F${n}-J${n}`, result: r2(f.total - f.file) },
-      f.fileTax, f.qbTax ?? "",
-      f.qbTax == null ? "" : { formula: `L${n}-M${n}`, result: r2(f.fileTax - f.qbTax) },
+      f.total == null ? "" : { formula: `ROUND(F${n}-J${n},2)`, result: r2(f.total - f.file) },
+      f.fileTax ?? "", f.qbTax ?? "",
+      f.qbTax == null || f.fileTax == null ? "" : { formula: `ROUND(L${n}-M${n},2)`, result: r2(f.fileTax - f.qbTax) },
+      v.type === "refund" ? f.fileTax ?? "" : "",
     ]);
-    [6, 10, 11, 12, 13, 14].forEach((c) => (row.getCell(c).numFmt = NUM));
-    const off = f.total == null || Math.abs(f.total - f.file) > 0.005 || (f.qbTax != null && Math.abs(f.fileTax - f.qbTax) > 0.005);
+    [6, 10, 11, 12, 13, 14, 15].forEach((c) => (row.getCell(c).numFmt = c >= 14 ? "#,##0.00" : NUM));
+    const off = f.total == null || Math.abs(f.total - f.file) > 0.005 || f.fileTax == null || (f.qbTax != null && Math.abs(f.fileTax - f.qbTax) > 0.005);
     if (off) row.eachCell((c) => (c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFDE7E7" } }));
   });
 }
@@ -61,10 +62,11 @@ export async function buildOutput(rows: OutRow[], account = process.env.DEPOSIT_
   ws.addRow(["Order", "Type", "Difference type", "Result", "Tax scenario", "In deposit", "Changed or planned", "Reason / needs review because"]).font = { bold: true };
   [10, 10, 22, 22, 12, 11, 70, 70].forEach((w, i) => (ws.getColumn(i + 1).width = w));
   for (const v of rows) {
-    const t = v.issues.some((i) => i.field === "Tax"), o = v.issues.some((i) => i.field !== "Tax");
-    const kind = v.status === "Matched" ? "Matched" : v.status === "Not found" ? "Not found" : o ? "Amount differs (not tax)" : t ? "Tax" : "Review";
-    ws.addRow([v.order, v.type === "sale" ? "Sale" : "Refund", kind, v.final || v.status, v.scenario, v.inDeposit ? "Yes" : "",
-      v.final === "Skipped" ? "Skipped by the user. Nothing was changed in QuickBooks." : v.final === "Tax to enter by hand" ? `Enter tax ${(v.taxToEnter ?? 0).toFixed(2)} by hand in QuickBooks (Edit sales tax, Apply override).` : changeText(v),
+    const initial = v.before || v;
+    const t = initial.issues.some((i) => i.field === "Tax"), o = initial.issues.some((i) => i.field !== "Tax");
+    const kind = initial.status === "Matched" ? "Matched" : v.status === "Not found" ? "Not found" : o ? "Amount differs (not tax)" : t ? "Tax" : "Review";
+    ws.addRow([v.order, v.type === "sale" ? "Sale" : "Refund", kind, v.final || v.status, initial.scenario, v.inDeposit ? "Yes" : "",
+      v.final === "Skipped" ? "Skipped by the user. Nothing was changed in QuickBooks." : v.final === "Tax to enter by hand" ? `Enter tax ${(v.taxToEnter ?? 0).toFixed(2)} by hand in QuickBooks (Edit sales tax, Apply override).` : changeText(initial),
       [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | ")]);
   }
 

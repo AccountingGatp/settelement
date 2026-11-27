@@ -1,23 +1,22 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { parseSettlement } from "@/lib/settlement";
+import { parseSettlement, type Row } from "@/lib/settlement";
 
 type Issue = { field: string; file: string; qbo: string; diff: number; note: string; auto: boolean };
 type Verdict = {
   order: string; type: "sale" | "refund"; customer: string; status: "Matched" | "Needs fix" | "Pending review" | "Not found"; scenario: string;
-  link?: string; settle: number; fileTax: number; qboTotal: number; qboTax: number; taxDiff: number; totalDiff: number; inDeposit: boolean;
+  link?: string; settle: number; fileTax: number | null; qboTotal: number; qboTax: number; taxDiff: number | null; totalDiff: number; inDeposit: boolean;
   issues: Issue[]; plan: { tax?: { mode: string; total?: number }; untaxShipping?: { name: string }; preview?: { taxFrom: number; taxTo: number; totalFrom: number; totalTo: number } }; blockers: string[]; notes: string[];
 };
-type Row = { order: string; type: "sale" | "refund"; amount: number; fileTax: number; fileFreight: number; txnId: string; customer: string; date?: string; depositNo?: string; receivedFrom?: string };
-type Result = Verdict & { final?: string; after?: Verdict; error?: string; message?: string; reason?: string; rolledBack?: boolean; link?: string; taxToEnter?: number };
+type Result = Verdict & { final?: string; before?: Verdict; error?: string; message?: string; reason?: string; link?: string; taxToEnter?: number };
 type ReadOut = {
   rows: Row[]; skipped: { txnId: string; order: string; status: string; amount: number; reason: string }[]; problems: string[];
   counts: Record<string, number>; missingInQbo: { order: string; type: string; docNumber: string }[]; prefix?: Record<string, string>; notes?: string[]; similar?: { type: string; docNumber: string; date: string; total: number; customer: string }[]; lookedFor?: string;
 };
 type St = { connected: boolean; companyName: string; environment: string; writesAllowed: boolean };
 
-const money = (n: number) => n.toFixed(2);
-const key = (r: { type: string; order: string }) => `${r.type}:${r.order}`;
+const money = (n: number | null) => n === null ? "–" : n.toFixed(2);
+const key = (r: Row) => JSON.stringify([r.type, r.order, r.txnId, r.docNumber, r.amount, r.date]);
 const chipClass = (s: string) => s.split(/[ ,]/)[0];
 async function post(url: string, body: unknown) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -41,6 +40,7 @@ export default function Home() {
   const [filter, setFilter] = useState("All");
   const [open, setOpen] = useState<string | null>(null);
   const cancel = useRef(false);
+  const [fixing, setFixing] = useState(false);
 
   useEffect(() => {
     fetch("/api/qb/status").then((r) => r.json()).then(setSt).catch(() => {});
@@ -49,7 +49,7 @@ export default function Home() {
   }, []);
 
   async function upload(f: File) {
-    setErr(""); setRead(null); setRes({}); setBusy("Reading the file and looking up QuickBooks…");
+    setErr(""); setRead(null); setRes({}); setBusy("Reading the file and looking up QuickBooks…"); setFilter("All");
     try {
       // The file is read here in the browser (the output workbooks are over 5 MB, more than the server accepts);
       // only the small list of rows goes to the server.
@@ -67,7 +67,7 @@ export default function Home() {
 
   async function runChecks() {
     if (!read) return;
-    cancel.current = false; setErr(""); setRes({});
+    cancel.current = false; setErr(""); setRes({}); setFilter("All");
     let done = 0;
     setProgress({ done, total: read.rows.length, label: "Checking against QuickBooks" });
     await pool(read.rows, 2, async (row) => {
@@ -83,20 +83,33 @@ export default function Home() {
   }
 
   function blankFor(row: Row): Result {
-    return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", settle: Math.abs(row.amount), fileTax: row.fileTax, qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false, issues: [], plan: {}, blockers: [], notes: [] };
+    return { order: row.order, type: row.type, customer: row.customer, status: "Pending review", scenario: "-", settle: Math.abs(row.amount), fileTax: row.fileTax, qboTotal: 0, qboTax: 0, taxDiff: null, totalDiff: 0, inDeposit: false, issues: [], plan: {}, blockers: [], notes: [] };
   }
 
   async function fixOne(row: Row): Promise<string> {
     const k = key(row);
     try {
       const j = await post("/api/fix", { row: withPrefix(row) });
-      const fin = j.verified ? "Corrected, verified" : j.manualTax ? "Tax to enter by hand" : j.refused ? "Failed" : j.applied ? "Failed, check by hand" : "";
-      setRes((p) => ({ ...p, [k]: { ...j.after, plan: j.before.plan, issues: j.applied ? j.before.issues : j.after.issues, blockers: j.after.blockers, final: fin || undefined, after: j.applied ? j.after : undefined, message: j.message, reason: j.reason, rolledBack: j.rolledBack, link: j.link, taxToEnter: j.taxToEnter, taxDiff: j.applied ? j.before.taxDiff : j.after.taxDiff, qboTax: j.before.qboTax, qboTotal: j.before.qboTotal } }));
+      const fin = j.verified ? "Corrected, verified" : j.manualTax ? "Tax to enter by hand" : j.applied ? "Failed, check by hand" : "";
+      setRes((p) => ({
+        ...p,
+        [k]: {
+          ...j.after, before: j.verified || j.applied ? j.before : undefined, final: fin || undefined,
+          message: j.message, reason: j.reason, link: j.link || j.after.link, taxToEnter: j.taxToEnter,
+        },
+      }));
       return fin;
     } catch (e) {
       setRes((p) => ({ ...p, [k]: { ...p[k], final: "Failed", error: e instanceof Error ? e.message : String(e) } }));
       return "Failed";
     }
+  }
+
+  async function fixSingle(row: Row) {
+    setFixing(true);
+    setFilter("All");
+    try { await fixOne(row); }
+    finally { setFixing(false); }
   }
 
   async function recheckOne(row: Row) {
@@ -115,7 +128,7 @@ export default function Home() {
     const todo = read.rows.filter((r) => res[key(r)]?.status === "Needs fix" && !res[key(r)]?.final);
     if (!todo.length) return;
     if (!confirm(`Apply the planned fix to ${todo.length} receipt(s) in QuickBooks?\n\nEach one is re-checked, saved and verified.`)) return;
-    cancel.current = false; let done = 0;
+    cancel.current = false; setErr(""); setFilter("All"); let done = 0;
     setProgress({ done, total: todo.length, label: "Fixing" });
     let failsInARow = 0;
     await pool(todo, 1, async (row) => {
@@ -131,7 +144,7 @@ export default function Home() {
   /** Every row that is not matched or fixed, with the reason and the exact change it needs, so nothing is lost. */
   function needsPerson() {
     const q = (x: string) => `"${String(x ?? "").replace(/"/g, '""')}"`;
-    const rows = Object.values(res).filter((v) => v.final !== "Corrected, verified" && v.status !== "Matched");
+    const rows = Object.values(res).filter((v) => v.final !== "Corrected, verified" && (v.status !== "Matched" || !!v.final));
     const head = ["Order", "Type", "Status", "File amount", "File tax", "QBO total", "QBO tax", "TaxDiff", "Change needed", "Reason"];
     const lines = rows.map((v) => [v.order, v.type, v.final || v.status, money(v.settle), money(v.fileTax), v.status === "Not found" ? "" : money(v.qboTotal), v.status === "Not found" ? "" : money(v.qboTax), v.status === "Not found" ? "" : money(v.taxDiff),
       v.final === "Skipped" ? "Skipped: " + summary({ ...v, final: undefined }) : summary(v), [v.reason, v.error, ...v.blockers].filter(Boolean).join(" | ")].map(q).join(","));
@@ -164,14 +177,14 @@ export default function Home() {
                       cells={<>
                         <td><b>{v.order}</b></td><td>{v.type === "sale" ? "Sale" : "Refund"}</td>
                         <td><span className={"chip " + chipClass(label(v))}>{label(v)}</span>{v.inDeposit && <span className="chip dep">In deposit</span>}{}</td>
-                        <td className="num">{money(v.settle)}</td><td className="num">{v.qboTotal ? money(v.qboTotal) : "-"}</td>
+                        <td className="num">{money(v.settle)}</td><td className="num">{v.status === "Not found" || v.error ? "–" : money(v.qboTotal)}</td>
                         <td className="num">{money(v.fileTax)}</td><td className="num">{money(v.qboTax)}</td>
-                        <td className="num">{v.status === "Not found" ? "–" : v.after ? money(v.after.taxDiff) : money(v.taxDiff)}</td>
+                        <td className="num">{v.status === "Not found" ? "–" : money(v.taxDiff)}</td>
                         <td className="small">{summary(v)}</td>
                         <td className="nowrap">
-                          {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix} onClick={(e) => { e.stopPropagation(); fixOne(row); }}>Fix</button> <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
-                          {v.final === "Skipped" && <button className="btn small ghost" onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
-                          {v.final === "Tax to enter by hand" && <button className="btn small" onClick={(e) => { e.stopPropagation(); recheckOne(row); }}>Check again</button>}
+                          {v.status === "Needs fix" && !v.final && <><button className="btn small" disabled={!canFix || !!progress || fixing} onClick={(e) => { e.stopPropagation(); fixSingle(row); }}>Fix</button> <button className="btn small ghost" disabled={!!progress || fixing} onClick={(e) => { e.stopPropagation(); skipOne(row, true); }}>Skip</button></>}
+                          {v.final === "Skipped" && <button className="btn small ghost" disabled={!!progress || fixing} onClick={(e) => { e.stopPropagation(); skipOne(row, false); }}>Undo skip</button>}
+                          {v.final === "Tax to enter by hand" && <button className="btn small" disabled={!!progress || fixing} onClick={(e) => { e.stopPropagation(); recheckOne(row); }}>Check again</button>}
                           {v.link && v.status !== "Matched" && v.status !== "Not found" && <> <a className="small" href={v.link} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Open in QuickBooks</a></>}
                         </td>
                       </>}
@@ -181,7 +194,7 @@ export default function Home() {
                         {v.reason && <p className="small"><b>Reason:</b> {v.reason}</p>}
                         {v.blockers.length > 0 && <><b>Needs a person because</b><ul>{v.blockers.map((b, i) => <li key={i}>{b}</li>)}</ul></>}
                         {v.issues.length > 0 && <><b>Differences</b><ul>{v.issues.map((i, n) => <li key={n}>{i.field}: File {i.file}, QuickBooks {i.qbo}. {i.note}{i.auto ? "" : " (manual)"}</li>)}</ul></>}
-                        {v.after && <p className="small">After saving: QuickBooks total {money(v.after.qboTotal)}, tax {money(v.after.qboTax)}, TaxDiff {money(v.after.taxDiff)}.</p>}
+                        {v.before && <p className="small">Before saving, QuickBooks showed {money(v.before.qboTotal)} total and {money(v.before.qboTax)} tax.</p>}
                       </div>} />
                   ) : null)}
                 </tbody>
@@ -209,7 +222,7 @@ export default function Home() {
         <h2><b>1</b> Upload the settlement file</h2>
         <label className={"drop" + (busy ? " busy" : "")}>
           {busy || <>Drop the settlement file here (Authorize.net download or the AuthorizeNet_…_output workbook) or <u>choose a file</u></>}
-          <input type="file" hidden accept=".xlsx,.xls,.csv" disabled={!!busy || !st?.connected} onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])} />
+          <input type="file" hidden accept=".xlsx,.xls,.csv" disabled={!!busy || !!progress || fixing || !st?.connected} onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])} />
         </label>
         {!st?.connected && <p className="small muted">Connect to QuickBooks first.</p>}
         {read && (
@@ -222,16 +235,21 @@ export default function Home() {
             </div>
             <p className="small muted">Skipped rows are not settled sales or credits: {Object.entries(read.counts).filter(([k]) => k !== "Settled Successfully" && k !== "Credited").map(([k, v]) => `${v} ${k}`).join(", ") || "none"}.</p>
             {read.problems.map((p, i) => <div key={i} className="note">{p}</div>)}
-            {read.missingInQbo.length > 0 && <div className="alert">{read.missingInQbo.length} order(s) are not in QuickBooks. <button className="link" onClick={() => setPopup(true)}>See the list</button></div>}
+            {read.missingInQbo.length > 0 && <div className="alert">{read.missingInQbo.length} order(s) need a receipt-number lookup. <button className="link" onClick={() => setPopup(true)}>See the list</button></div>}
           </>
         )}
       </section>
 
       {read && read.rows.length > 0 && (
         <section className="card">
-          <h2><b>2</b> Check against QuickBooks <span className="muted small">(nothing is changed)</span></h2>
+          <div className="section-heading">
+            <h2><b>2</b> Check against QuickBooks</h2>
+            <button className="btn small" disabled={!canFix || !needFix || !!progress || fixing} onClick={fixAll}>
+              Fix all{needFix > 0 ? ` (${needFix})` : ""}
+            </button>
+          </div>
           <div className="row-actions">
-            <button className="btn small" disabled={!!progress} onClick={runChecks}>{Object.keys(res).length ? "Run the check again" : "Run the check"}</button>
+            <button className="btn small" disabled={!!progress || fixing} onClick={runChecks}>{Object.keys(res).length ? "Run the check again" : "Run the check"}</button>
             {progress && <button className="btn small ghost" onClick={() => (cancel.current = true)}>Stop</button>}
             <button className="btn small ghost" disabled={!Object.keys(res).length} onClick={report}>Download output file (Excel)</button>
             <button className="btn small ghost" disabled={!Object.keys(res).length} onClick={needsPerson}>Download list for a person (CSV)</button>
@@ -242,36 +260,26 @@ export default function Home() {
               <div className="filters">
                 {["All", ...Object.keys(counts)].map((f) => <button key={f} className={filter === f ? "on" : ""} onClick={() => setFilter(f)}>{f}{f !== "All" ? ` (${counts[f]})` : ""}</button>)}
               </div>
-              {(["tax", "other", "rest"] as const).map((sec) => {
+              {(["tax", "other", "corrected", "rest"] as const).map((sec) => {
                 const items = shown.filter((x) => x.v && sectionOf(x.v) === sec);
                 if (!items.length) return null;
                 const head = sec === "tax" ? ["Tax differences", "Only the tax is different. The fix changes the QuickBooks tax to the file's tax (and the total follows)."]
                   : sec === "other" ? ["Amount differs (not only tax)", "The difference is more than tax, so nothing is changed automatically. Review these by hand."]
-                  : ["Matched, needs review, or not found", "No automatic fix for these."];
-                return (<div key={sec} className="sect"><h3>{head[0]} <span className="muted small">({items.length})</span></h3><p className="small muted">{head[1]}</p>{renderTable(items)}</div>);
+                  : sec === "corrected" ? ["Corrected", ""] : ["Matched, needs review, or not found", ""];
+                return (<div key={sec} className="sect"><h3>{head[0]} <span className="muted small">({items.length})</span></h3>{head[1] && <p className="small muted">{head[1]}</p>}{renderTable(items)}</div>);
               })}
             </>
           )}
         </section>
       )}
 
-      {needFix > 0 && (
-        <section className="card">
-          <h2><b>3</b> Apply the fixes</h2>
-          <p className="small">{needFix} receipt(s) have a planned fix. Each is re-checked, saved, re-read from QuickBooks and compared with the file again. If it does not match, the receipt is put back. Rows that need a person are never changed.</p>
-          <button className="btn" disabled={!canFix || !!progress} onClick={fixAll}>Fix all {needFix} that are ready</button>
-          {!canFix && <p className="small muted">Changes are switched off for this QuickBooks company.</p>}
-        </section>
-      )}
-
-
       {popup && read && (
         <div className="modal-bg" onClick={() => setPopup(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h2>Not found in QuickBooks</h2>
-            <p className="small">These {read.missingInQbo.length} order(s) from the file are not in QuickBooks. They will not be created. The other rows can still be checked.</p>
+            <h2>Receipt numbers to check</h2>
+            <p className="small">No receipt matched the expected number for these {read.missingInQbo.length} order(s). Run the check to look for alternate receipt numbers.</p>
             {read.similar && read.similar.length > 0 && <div className="alert">Every order is missing, but QuickBooks has {read.similar.map((f) => `“${f.docNumber}”`).join(", ")} for the first order, while the app looked for “{read.lookedFor}”. The number format is different: set <b>DOC_PREFIX_SALE</b> in Vercel to the text before the order number (or <b>none</b> if there is none) and redeploy.</div>}
-            <ul>{read.missingInQbo.map((m) => <li key={m.docNumber}>{m.docNumber} <span className="muted">({m.type})</span></li>)}</ul>
+            <ul>{read.missingInQbo.map((m, index) => <li key={`${m.type}:${m.docNumber}:${index}`}>{m.docNumber} <span className="muted">({m.type})</span></li>)}</ul>
             <button className="btn" onClick={() => setPopup(false)}>OK, continue</button>
           </div>
         </div>
@@ -280,7 +288,8 @@ export default function Home() {
   );
 }
 
-function sectionOf(v: Result): "tax" | "other" | "rest" {
+function sectionOf(v: Result): "tax" | "other" | "corrected" | "rest" {
+  if (v.final === "Corrected, verified") return "corrected";
   const tax = v.issues.some((i) => i.field === "Tax"), other = v.issues.some((i) => i.field !== "Tax");
   if (v.status === "Matched" || v.status === "Not found") return "rest";
   if (other) return "other";

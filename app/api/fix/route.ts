@@ -1,9 +1,8 @@
-// Apply the tax fix for one row. The plan is re-computed here from fresh QuickBooks data (the browser's copy is never trusted),
-// the receipt is saved, re-read from QuickBooks and compared with the file again. If it does not match, the receipt is put back.
+// Recompute the plan from QuickBooks, save it and verify the persisted figures to the cent.
 import { handler } from "@/lib/route";
 import { checkRow, parseRow } from "@/lib/run";
-import { applyFix, assertWritable, overrideTax, recalc, reread, restore, explainFailure, qbLink, type FixPlan } from "@/lib/qb";
-import { reconcile, verified } from "@/lib/recon";
+import { applyTaxStep, assertWritable, recalc, reread, restore, explainFailure, qbLink, type FixStep, type QDoc } from "@/lib/qb";
+import { reconcile, sameMoney, verified } from "@/lib/recon";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
@@ -11,50 +10,97 @@ export const POST = handler(async (req: Request) => {
   assertWritable();
   const row = parseRow(await req.json());
   const { verdict: before, doc } = await checkRow(row);
-  if (before.status !== "Needs fix" || !doc || !before.plan.tax) return { before, after: before, verified: false, applied: false, message: `Nothing was changed: status is “${before.status}”.` };
+  if (before.status !== "Needs fix" || !doc || !before.plan.tax) {
+    return { before, after: before, verified: false, applied: false, message: `Current QuickBooks status is “${before.status}”.` };
+  }
 
   const link = qbLink(row.type, doc.id);
-  const target = before.plan.tax;
-  const taxToEnter = target.mode === "set" ? target.total : undefined;
-  // Ways to reach the file's tax, in order. The first one that verifies wins; a failed one is undone before the next is tried.
-  //  remove: all lines non-taxable.  untax: the shipping line non-taxable.  override: the exact amount, as the "See the math" screen stores it.
-  type Step = { name: string; plan?: FixPlan; override?: boolean };
-  const attempts: Step[] = [];
-  if (target.mode === "remove") attempts.push({ name: "remove tax", plan: { tax: target } });
-  else {
-    if (before.plan.untaxShipping) attempts.push({ name: "shipping non-taxable", plan: { untaxItemId: before.plan.untaxShipping.itemId } });
-    if (before.scenario !== "D" && process.env.TAX_OVERRIDE_API !== "no") attempts.push({ name: "tax override", override: true });
+  const target = before.plan.tax.mode === "remove" ? 0 : before.plan.tax.total;
+  const shipping = before.plan.untaxShipping;
+  const steps: FixStep[] = [];
+  if (target === 0) steps.push({ kind: "remove" });
+  if (shipping) steps.push({ kind: "shipping", itemId: shipping.itemId });
+  if (process.env.TAX_OVERRIDE_API !== "no") {
+    if (doc.raw.TxnTaxDetail?.TaxLine?.length) steps.push({ kind: "override", tax: target });
+    steps.push({ kind: "total", tax: target });
   }
-  if (!attempts.length)
-    return { before, after: before, verified: false, applied: false, manualTax: true, taxToEnter, link, tried: [],
-      message: `Nothing was changed. Open the receipt, choose Edit sales tax (see the math), enter ${taxToEnter!.toFixed(2)}, reason Other, Apply override, Save. Then check this row again.` };
 
-  const original = JSON.parse(JSON.stringify(doc.raw)); // kept so the receipt can be put back
-  let cur = doc, wrote = false, lastReason = "", rolledBack = true, rollbackError = "";
-  const tried: string[] = []; // what QuickBooks actually held after each try, to show the person
-  for (const step of attempts) {
-    cur = await reread(row.type, doc.id); // fresh version number before every try
+  let current = doc;
+  let lastReason = "";
+  let rolledBack = false;
+  const tried: string[] = [];
+  const readCurrent = () => reread(row.type, doc.id);
+  const view = (receipt: QDoc) => ({ ...reconcile(row, receipt), link });
+  async function verifyVersion() {
+    const observed = await readCurrent();
+    if (observed.syncToken !== current.syncToken) throw new Error("The receipt changed during verification.");
+    return observed;
+  }
+
+  for (const step of steps) {
+    const initial = current;
+    let saved = false;
     try {
-      if (step.override) { await overrideTax(row.type, doc.id, target.mode === "set" ? target.total : 0); wrote = true; }
-      else { await applyFix(cur, step.plan!); wrote = true; await recalc(row.type, doc.id); }
+      current = await applyTaxStep(current, step);
+      saved = true;
+      let observed = await verifyVersion();
+      let after = view(observed);
+      if (!verified(after)) {
+        current = await recalc(current);
+        observed = await verifyVersion();
+        after = view(observed);
+      }
+      if (step.kind === "override" && after.status === "Needs fix" && Math.abs(after.taxDiff ?? 0) === 0.01) {
+        // The first save may leave one cent after QuickBooks recalculates the tax lines.
+        current = await applyTaxStep(observed, step);
+        observed = await verifyVersion();
+        after = view(observed);
+        if (!verified(after)) {
+          current = await recalc(current);
+          observed = await verifyVersion();
+          after = view(observed);
+        }
+      }
+      if (verified(after)) return { before, after, verified: true, applied: true, link, message: "Saved and verified. QuickBooks tax and total match the file." };
+      lastReason = explainFailure(null, { taxStillWrong: after.taxDiff !== 0, totalStillWrong: after.totalDiff !== 0 });
+      tried.push(`${step.kind}: QuickBooks showed tax ${observed.tax.toFixed(2)} and total ${observed.total.toFixed(2)}.`);
+    } catch (error) {
+      lastReason = explainFailure(error);
+      tried.push(`${step.kind}: ${lastReason}`);
     }
-    catch (e) { lastReason = explainFailure(e); continue; } // QuickBooks refused: nothing was written
-    const again = await reread(row.type, doc.id);
-    const after = reconcile(row, again);
-    if (verified(after)) return { before, after, verified: true, applied: true, link, message: "Saved and verified: QuickBooks tax and total now match the file." };
-    lastReason = explainFailure(null, { taxStillWrong: Math.abs(after.taxDiff) > 0.01, totalStillWrong: Math.abs(after.totalDiff) > 0.01 });
-    tried.push(`${step.name}: QuickBooks showed tax ${again.tax.toFixed(2)}, total ${again.total.toFixed(2)} (needed ${after.fileTax.toFixed(2)} and ${after.settle.toFixed(2)})`);
-    try { // put the receipt back and check that it really is back
-      cur = await restore(row.type, doc.id, original);
-      rolledBack = Math.abs(cur.total - doc.total) < 0.011 && Math.abs(cur.tax - doc.tax) < 0.011;
-      if (!rolledBack) rollbackError = `After the rollback QuickBooks shows total ${cur.total} and tax ${cur.tax}, not the original ${doc.total} and ${doc.tax}.`;
-    } catch (e) { rolledBack = false; rollbackError = e instanceof Error ? e.message : String(e); break; }
+
+    try {
+      const observed = await readCurrent();
+      if (observed.syncToken !== current.syncToken) throw new Error("The receipt changed during the fix. Check its current values in QuickBooks.");
+      if (!saved) {
+        current = observed;
+        continue;
+      }
+      current = await restore(current, initial);
+      let restored = await verifyVersion();
+      const originalFigures = (receipt: QDoc) => sameMoney(receipt.tax, initial.tax) && sameMoney(receipt.total, initial.total);
+      if (!originalFigures(restored)) {
+        current = await recalc(current);
+        restored = await verifyVersion();
+      }
+      const lineCodes = (receipt: QDoc) => receipt.lines.filter((line) => line.kind === "item").map(({ itemId, taxCode }) => [itemId, taxCode]);
+      if (!originalFigures(restored) || JSON.stringify(lineCodes(restored)) !== JSON.stringify(lineCodes(initial))) {
+        throw new Error("QuickBooks did not confirm the original figures and item tax codes after restoring the receipt.");
+      }
+      current = restored;
+      rolledBack = true;
+    } catch (error) {
+      const observed = await readCurrent().catch(() => null);
+      return {
+        before, after: observed ? view(observed) : before, verified: false, applied: true, rolledBack: false, link, tried,
+        reason: lastReason, message: `${explainFailure(error)} Open the receipt in QuickBooks before running more fixes.`,
+      };
+    }
   }
 
-  if (!rolledBack)
-    return { before, after: before, verified: false, applied: true, reason: lastReason, rolledBack: false, rollbackError, link, tried, message: `Not fixed: ${lastReason} The receipt could NOT be put back automatically (${rollbackError}). Open it in QuickBooks and check it. What happened: ${tried.join("; ")}.` };
-  if (target.mode === "set")
-    return { before, after: before, verified: false, applied: false, manualTax: true, taxToEnter, reason: lastReason, rolledBack: wrote, link,
-      tried, message: `QuickBooks would not take this tax through the API (${lastReason}; ${tried.join("; ")}). Nothing was left changed. Open the receipt, choose Edit sales tax, enter ${taxToEnter!.toFixed(2)}, Apply override, Save. Then check this row again.` };
-  return { before, after: before, verified: false, applied: false, refused: true, reason: lastReason, rolledBack: wrote, link, tried, message: `Not fixed: ${lastReason}${wrote ? " The receipt was put back to how it was." : " Nothing was changed."}` };
+  const reason = lastReason || "An automatic tax override is unavailable for this receipt.";
+  return {
+    before, after: view(current), verified: false, applied: false, manualTax: true, taxToEnter: target, rolledBack, link, tried, reason,
+    message: `Enter ${target.toFixed(2)} in Edit sales tax in QuickBooks, save the receipt, and check this row again.`,
+  };
 });

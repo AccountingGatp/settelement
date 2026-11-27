@@ -4,9 +4,9 @@
 import type { QDoc } from "./qb";
 import type { Row } from "./settlement";
 
-export const TOL = 0.01;
-const r2 = (n: number) => Math.round(n * 100) / 100;
-const near = (a: number, b: number, t = TOL) => Math.abs(a - b) <= t + 1e-9;
+const cents = (n: number) => Math.round(n * 100);
+export const sameMoney = (a: number, b: number) => cents(a) === cents(b);
+const difference = (a: number, b: number) => (cents(a) - cents(b)) / 100;
 
 export type Issue = { field: string; file: string; qbo: string; diff: number; note: string; auto: boolean };
 export type TaxPlan = { mode: "set"; total: number } | { mode: "remove" };
@@ -15,23 +15,23 @@ export type Status = "Matched" | "Needs fix" | "Pending review" | "Not found";
 export type Scenario = "A" | "B" | "C" | "D" | "-";
 
 export type Verdict = {
-  order: string; type: "sale" | "refund"; customer: string; date?: string; depositNo?: string; receivedFrom?: string; qboCustomer?: string; link?: string; taxToEnter?: number; status: Status; scenario: Scenario;
-  settle: number; fileTax: number; qboTotal: number; qboTax: number;
-  taxDiff: number; totalDiff: number; inDeposit: boolean;
+  order: string; type: "sale" | "refund"; customer: string; date?: string; depositNo?: string; receivedFrom?: string; qboCustomer?: string; link?: string; docNumber?: string; taxToEnter?: number; status: Status; scenario: Scenario;
+  settle: number; fileTax: number | null; qboTotal: number; qboTax: number;
+  taxDiff: number | null; totalDiff: number; inDeposit: boolean;
   issues: Issue[]; plan: Plan; blockers: string[]; notes: string[];
 };
 
 const blank = (row: Row): Verdict => ({
   order: row.order, type: row.type, customer: row.customer, date: row.date, depositNo: row.depositNo, receivedFrom: row.receivedFrom, status: "Pending review", scenario: "-",
-  settle: Math.abs(row.amount), fileTax: Math.abs(row.fileTax || 0), qboTotal: 0, qboTax: 0, taxDiff: 0, totalDiff: 0, inDeposit: false,
+  settle: Math.abs(row.amount), fileTax: row.fileTax === null ? null : Math.abs(row.fileTax), qboTotal: 0, qboTax: 0, taxDiff: null, totalDiff: 0, inDeposit: false,
   issues: [], plan: {}, blockers: [], notes: [],
 });
 
 /** A: file has no tax but QuickBooks does. B: both have tax, they differ. C: equal. D: file has tax, QuickBooks none. */
 export function scenarioOf(fileTax: number, qboTax: number): Scenario {
-  if (near(fileTax, qboTax)) return "C";
-  if (fileTax <= TOL && qboTax > TOL) return "A";
-  if (fileTax > TOL && qboTax <= TOL) return "D";
+  if (sameMoney(fileTax, qboTax)) return "C";
+  if (fileTax === 0) return "A";
+  if (qboTax === 0) return "D";
   return "B";
 }
 
@@ -40,9 +40,9 @@ export function scenarioOf(fileTax: number, qboTax: number): Scenario {
  *  Shipping may be the QuickBooks shipping field (item SHIPPING_ITEM_ID), which often carries no tax code at all. */
 function shippingToUntax(q: QDoc, fileTax: number): { itemId: string; name: string } | undefined {
   const ship = q.lines.find((l) => l.kind === "item" && !!l.itemId && l.taxCode !== "NON" && (l.itemId === "SHIPPING_ITEM_ID" || /ship|freight|deliver/i.test(l.name)));
-  if (!ship || ship.amount <= TOL) return undefined;
-  const surplus = r2(q.tax - fileTax);
-  return surplus > TOL && surplus <= ship.amount * 0.2 ? { itemId: ship.itemId, name: ship.name || "Shipping" } : undefined;
+  if (!ship || ship.amount <= 0) return undefined;
+  const surplus = difference(q.tax, fileTax);
+  return surplus > 0 && surplus <= ship.amount * 0.2 ? { itemId: ship.itemId, name: ship.name || "Shipping" } : undefined;
 }
 
 export function reconcile(row: Row, q: QDoc | null): Verdict {
@@ -54,43 +54,47 @@ export function reconcile(row: Row, q: QDoc | null): Verdict {
     return v;
   }
   v.qboCustomer = q.customer; // the customer name QuickBooks holds; the output file's "Received From" uses it
-  v.qboTotal = q.total; v.qboTax = q.tax; v.inDeposit = q.inDeposit;
-  v.taxDiff = r2(v.fileTax - q.tax);
-  v.totalDiff = r2(v.settle - q.total);
-  v.scenario = scenarioOf(v.fileTax, q.tax);
+  v.qboTotal = q.total; v.qboTax = q.tax; v.inDeposit = q.inDeposit; v.docNumber = q.docNumber;
+  v.totalDiff = difference(v.settle, q.total);
   if (q.inDeposit) v.notes.push("In deposit");
 
-  const pre = r2(q.total - q.tax);            // what QuickBooks holds before tax
-  const expected = r2(pre + v.fileTax);       // what the total will be once the tax equals the file's tax
-
-  if (row.type === "refund") {
-    // the file's tax column belongs to the original order, so a refund is never changed automatically
-    if (!near(v.taxDiff, 0) || !near(v.totalDiff, 0)) {
-      if (!near(v.taxDiff, 0)) v.issues.push({ field: "Tax", file: v.fileTax.toFixed(2), qbo: q.tax.toFixed(2), diff: v.taxDiff, note: "Refunds are not changed automatically.", auto: false });
-      if (!near(v.totalDiff, 0)) v.issues.push({ field: "Amount", file: v.settle.toFixed(2), qbo: q.total.toFixed(2), diff: v.totalDiff, note: "Refunds are not changed automatically.", auto: false });
-      v.blockers.push("Refund receipts are not changed automatically. Review by hand.");
-    }
-  } else if (!near(expected, v.settle)) {
-    // the difference is more than tax (a missing or wrong line, for example): this tool only corrects tax
-    v.issues.push({ field: "Amount before tax", file: r2(v.settle - v.fileTax).toFixed(2), qbo: pre.toFixed(2), diff: r2(v.settle - expected), note: "Not a tax difference. Nothing was changed.", auto: false });
-    v.blockers.push(`QuickBooks holds ${pre.toFixed(2)} before tax. With the file's tax ${v.fileTax.toFixed(2)} that makes ${expected.toFixed(2)}, but the file amount is ${v.settle.toFixed(2)}. The ${Math.abs(r2(v.settle - expected)).toFixed(2)} difference is not tax (for example a missing or wrong line), so review it by hand.`);
-  } else if (v.scenario !== "C") {
-    v.plan.tax = v.scenario === "A" ? { mode: "remove" } : { mode: "set", total: v.fileTax };
-    let note = v.scenario === "A" ? "File has no tax: remove the tax (untick Taxable on every line)." : v.scenario === "D" ? "Add tax to match the file." : "Set total tax to the file's tax.";
-    if (v.scenario === "B" && q.tax > v.fileTax + TOL) {
-      const ship = shippingToUntax(q, v.fileTax);
-      if (ship) { v.plan.untaxShipping = ship; note = `QuickBooks taxed shipping: make “${ship.name}” non-taxable so the tax becomes the file's tax.`; }
-    }
-    v.plan.preview = { taxFrom: q.tax, taxTo: v.scenario === "A" ? 0 : v.fileTax, totalFrom: q.total, totalTo: r2(pre + (v.scenario === "A" ? 0 : v.fileTax)) };
-    v.issues.push({ field: "Tax", file: v.fileTax.toFixed(2), qbo: q.tax.toFixed(2), diff: v.taxDiff, note, auto: true });
+  if (v.fileTax === null) {
+    v.blockers.push("The file does not identify the refunded tax. Use a settlement export with refund tax or supply Refund Tax Amount in the workbook.");
+    return v;
+  }
+  const fileTax = v.fileTax;
+  v.taxDiff = difference(fileTax, q.tax);
+  v.scenario = scenarioOf(fileTax, q.tax);
+  if (v.taxDiff === 0 && v.totalDiff === 0) {
+    v.status = "Matched";
+    return v;
+  }
+  if (row.reviewReason) {
+    v.blockers.push(row.reviewReason);
+    return v;
   }
 
-  const clean = v.issues.length === 0 && near(v.totalDiff, 0) && near(v.taxDiff, 0) && v.blockers.length === 0;
-  v.status = clean ? "Matched" : v.blockers.length ? "Pending review" : "Needs fix";
+  const fileSubtotal = difference(v.settle, fileTax);
+  const qbSubtotal = difference(q.total, q.tax);
+  if (!sameMoney(fileSubtotal, qbSubtotal)) {
+    v.issues.push({ field: "Amount before tax", file: fileSubtotal.toFixed(2), qbo: qbSubtotal.toFixed(2), diff: difference(fileSubtotal, qbSubtotal), note: "Review the amount before tax.", auto: false });
+    v.blockers.push(`The file amount before tax is ${fileSubtotal.toFixed(2)} and QuickBooks shows ${qbSubtotal.toFixed(2)}. Review the receipt lines before changing the tax.`);
+    return v;
+  }
+
+  v.plan.tax = v.scenario === "A" ? { mode: "remove" } : { mode: "set", total: fileTax };
+  let note = v.scenario === "A" ? "Remove the tax." : "Set total tax to the file's tax.";
+  if (v.scenario === "B" && q.tax > fileTax) {
+    const ship = shippingToUntax(q, fileTax);
+    if (ship) { v.plan.untaxShipping = ship; note = `Make “${ship.name}” non-taxable and verify the tax.`; }
+  }
+  v.plan.preview = { taxFrom: q.tax, taxTo: fileTax, totalFrom: q.total, totalTo: v.settle };
+  v.issues.push({ field: "Tax", file: fileTax.toFixed(2), qbo: q.tax.toFixed(2), diff: v.taxDiff, note, auto: true });
+  v.status = "Needs fix";
   return v;
 }
 
 /** After a fix is saved and re-read: did QuickBooks end up matching the file? */
 export function verified(after: Verdict): boolean {
-  return after.status === "Matched";
+  return after.status === "Matched" && after.taxDiff === 0 && after.totalDiff === 0;
 }
